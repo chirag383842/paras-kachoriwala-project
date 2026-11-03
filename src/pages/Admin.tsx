@@ -37,6 +37,10 @@ import {
   Music,
   Sparkles,
   Leaf,
+  Database,
+  Copy,
+  ExternalLink,
+  AlertTriangle,
 } from 'lucide-react';
 import { login, logout, getAuthUser, checkLockout, type AuthUser } from '@/lib/auth';
 import {
@@ -55,7 +59,10 @@ import {
   deleteGalleryImage,
   clearAllGalleryImages,
   syncAuthorGalleryToSupabase,
+  checkSupabaseHealth,
+  type SupabaseHealthStatus,
 } from '@/lib/hooks';
+import { SUPABASE_SETUP_SQL } from '@/lib/supabaseSyncSql';
 import {
   getGoogleSheetUrl,
   setGoogleSheetUrl,
@@ -148,6 +155,36 @@ export default function Admin({ onNavigate }: Props) {
   const [syncingReviews, setSyncingReviews] = useState(false);
   const [testingWebhook, setTestingWebhook] = useState(false);
   const [webhookTestResult, setWebhookTestResult] = useState<{ success: boolean; message: string } | null>(null);
+
+  // Cloud Database Real-Time Sync Diagnostic State
+  const [cloudHealth, setCloudHealth] = useState<SupabaseHealthStatus | null>(null);
+  const [checkingCloudHealth, setCheckingCloudHealth] = useState(false);
+  const [sqlCopied, setSqlCopied] = useState(false);
+  const [showSqlModal, setShowSqlModal] = useState(false);
+
+  const runCloudHealthCheck = async () => {
+    setCheckingCloudHealth(true);
+    try {
+      const res = await checkSupabaseHealth();
+      setCloudHealth(res);
+    } catch {
+      // ignore
+    } finally {
+      setCheckingCloudHealth(false);
+    }
+  };
+
+  useEffect(() => {
+    if (user) {
+      runCloudHealthCheck();
+    }
+  }, [user]);
+
+  const handleCopySql = () => {
+    navigator.clipboard.writeText(SUPABASE_SETUP_SQL);
+    setSqlCopied(true);
+    setTimeout(() => setSqlCopied(false), 4000);
+  };
 
   // Feedback & Reviews state
   const { data: feedbackList, loading: loadingFeedback, error: feedbackError, refetch: refetchFeedback } = useFeedbackList();
@@ -276,10 +313,15 @@ export default function Admin({ onNavigate }: Props) {
 
     if (res.success) {
       setIsOpen(true);
-      setStatusMessage(
-        'Stall is now OPEN for today! Next day it will automatically follow the daily 7:30 PM – 12:00 AM schedule.'
-      );
-      setTimeout(() => setStatusMessage(''), 5000);
+      if (res.rlsBlocked) {
+        setStatusError('⚠️ Changed locally on this device, but NOT synced to other customer phones! Supabase RLS is blocking remote updates. Click "View SQL" above to run the 1-click fix in Supabase.');
+        void runCloudHealthCheck();
+      } else {
+        setStatusMessage(
+          'Stall is now OPEN for today! Next day it will automatically follow the daily 7:30 PM – 12:00 AM schedule.'
+        );
+        setTimeout(() => setStatusMessage(''), 5000);
+      }
     } else {
       setStatusError(res.error ?? 'Unable to publish store status.');
     }
@@ -289,7 +331,7 @@ export default function Admin({ onNavigate }: Props) {
   const handleForceCloseNow = async () => {
     if (
       !confirm(
-        'Close the stall immediately? The store will be marked CLOSED right now. You can click OPEN NOW or Resume Schedule at any time.'
+        'Close the stall now? The store will be marked CLOSED for the rest of today, and will automatically reopen tomorrow according to the normal daily schedule (7:30 PM IST).'
       )
     ) {
       return;
@@ -298,20 +340,26 @@ export default function Admin({ onNavigate }: Props) {
     setStatusMessage('');
     setStatusError('');
 
+    const ist = getISTDate();
     const res = await updateStoreStatus({
       is_open: false,
       crowd_level: crowd,
       force_open_date: null,
-      closed_for_date: null,
+      closed_for_date: ist.dateString,
       override_mode: 'closed_now',
     });
 
     if (res.success) {
       setIsOpen(false);
-      setStatusMessage(
-        'Stall is now marked CLOSED NOW. Customers will see "Currently Closed".'
-      );
-      setTimeout(() => setStatusMessage(''), 5000);
+      if (res.rlsBlocked) {
+        setStatusError('⚠️ Changed locally on this device, but NOT synced to other customer phones! Supabase RLS is blocking remote updates. Click "View SQL" above to run the 1-click fix in Supabase.');
+        void runCloudHealthCheck();
+      } else {
+        setStatusMessage(
+          `Stall marked CLOSED for today (${ist.dateString}). Tomorrow it will automatically reopen per normal schedule (7:30 PM – 12:00 AM IST).`
+        );
+        setTimeout(() => setStatusMessage(''), 6000);
+      }
     } else {
       setStatusError(res.error ?? 'Unable to publish store status.');
     }
@@ -342,10 +390,15 @@ export default function Admin({ onNavigate }: Props) {
 
     if (res.success) {
       setIsOpen(false);
-      setStatusMessage(
-        `Shop closed for today (${ist.dateString}). The system will automatically reset tomorrow at 7:30 PM IST.`
-      );
-      setTimeout(() => setStatusMessage(''), 5000);
+      if (res.rlsBlocked) {
+        setStatusError('⚠️ Changed locally on this device, but NOT synced to other customer phones! Supabase RLS is blocking remote updates. Click "View SQL" above to run the 1-click fix in Supabase.');
+        void runCloudHealthCheck();
+      } else {
+        setStatusMessage(
+          `Shop closed for today (${ist.dateString}). The system will automatically reset tomorrow at 7:30 PM IST.`
+        );
+        setTimeout(() => setStatusMessage(''), 5000);
+      }
     } else {
       setStatusError(res.error ?? 'Unable to close the shop for today. Please try again.');
     }
@@ -368,10 +421,15 @@ export default function Admin({ onNavigate }: Props) {
 
     if (res.success) {
       setIsOpen(nowWithinSchedule);
-      setStatusMessage(
-        `Overrides cleared! Store is now following the real-time automatic schedule (7:30 PM – 12:00 AM daily). Currently ${nowWithinSchedule ? 'OPEN' : 'CLOSED'}.`
-      );
-      setTimeout(() => setStatusMessage(''), 5000);
+      if (res.rlsBlocked) {
+        setStatusError('⚠️ Changed locally on this device, but NOT synced to other customer phones! Supabase RLS is blocking remote updates. Click "View SQL" above to run the 1-click fix in Supabase.');
+        void runCloudHealthCheck();
+      } else {
+        setStatusMessage(
+          `Overrides cleared! Store is now following the real-time automatic schedule (7:30 PM – 12:00 AM daily). Currently ${nowWithinSchedule ? 'OPEN' : 'CLOSED'}.`
+        );
+        setTimeout(() => setStatusMessage(''), 5000);
+      }
     } else {
       setStatusError(res.error ?? 'Unable to update store status.');
     }
@@ -396,8 +454,13 @@ export default function Admin({ onNavigate }: Props) {
     });
 
     if (res.success) {
-      setStatusMessage(`Live crowd meter updated to "${crowd}"!`);
-      setTimeout(() => setStatusMessage(''), 4000);
+      if (res.rlsBlocked) {
+        setStatusError('⚠️ Changed locally on this device, but NOT synced to other customer phones! Supabase RLS is blocking remote updates. Click "View SQL" above to run the 1-click fix in Supabase.');
+        void runCloudHealthCheck();
+      } else {
+        setStatusMessage(`Live crowd meter updated to "${crowd}"!`);
+        setTimeout(() => setStatusMessage(''), 4000);
+      }
     } else {
       setStatusError(res.error ?? 'Unable to update crowd level.');
     }
@@ -1225,6 +1288,163 @@ export default function Admin({ onNavigate }: Props) {
           </div>
         </div>
 
+        {/* Real-Time Multi-Device Cloud Sync Health Bar */}
+        {cloudHealth && !cloudHealth.isHealthy && (
+          <div className="mt-6 rounded-2xl bg-amber-500/10 border-2 border-amber-500/40 p-5 sm:p-6 text-charcoal-900 shadow-md animate-fade-up">
+            <div className="flex flex-col md:flex-row md:items-start justify-between gap-4">
+              <div className="flex items-start gap-3.5">
+                <div className="grid h-11 w-11 shrink-0 place-items-center rounded-xl bg-amber-500 text-white shadow-sm mt-0.5">
+                  <AlertTriangle size={22} />
+                </div>
+                <div>
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <h2 className="text-base sm:text-lg font-bold text-amber-950">
+                      Cross-Device Sync Setup Required
+                    </h2>
+                    <span className="inline-flex items-center gap-1 text-[11px] font-bold px-2.5 py-0.5 rounded-full bg-amber-200/80 text-amber-900 border border-amber-300">
+                      Changes only saving locally on this device
+                    </span>
+                  </div>
+                  <p className="mt-1 text-xs sm:text-sm text-amber-900/90 leading-relaxed max-w-3xl">
+                    Edits made here are currently saved only in your local browser cache because Supabase database write policies are not yet active. Run the 1-click SQL script below in your Supabase SQL editor to enable instant, real-time sync across all customer phones and devices.
+                  </p>
+                  <div className="mt-3 flex flex-wrap items-center gap-2 text-xs">
+                    <span className={`px-2.5 py-1 rounded-lg font-semibold flex items-center gap-1.5 ${cloudHealth.storeStatusWritable ? 'bg-leaf-100 text-leaf-800' : 'bg-red-100 text-red-800'}`}>
+                      {cloudHealth.storeStatusWritable ? '✓ Store Status Writable' : '✗ Store Status Blocked (RLS)'}
+                    </span>
+                    <span className={`px-2.5 py-1 rounded-lg font-semibold flex items-center gap-1.5 ${cloudHealth.productsWritable ? 'bg-leaf-100 text-leaf-800' : 'bg-red-100 text-red-800'}`}>
+                      {cloudHealth.productsWritable ? '✓ Products Writable' : '✗ Products Blocked (RLS)'}
+                    </span>
+                    <span className={`px-2.5 py-1 rounded-lg font-semibold flex items-center gap-1.5 ${cloudHealth.galleryTableExists ? 'bg-leaf-100 text-leaf-800' : 'bg-red-100 text-red-800'}`}>
+                      {cloudHealth.galleryTableExists ? '✓ Gallery Table Ready' : '✗ Gallery Table Missing'}
+                    </span>
+                    <span className={`px-2.5 py-1 rounded-lg font-semibold flex items-center gap-1.5 ${cloudHealth.feedbackWritable ? 'bg-leaf-100 text-leaf-800' : 'bg-red-100 text-red-800'}`}>
+                      {cloudHealth.feedbackWritable ? '✓ Customer Reviews Writable' : '✗ Customer Reviews Blocked (RLS)'}
+                    </span>
+                  </div>
+                </div>
+              </div>
+
+              <div className="flex flex-wrap sm:flex-nowrap md:flex-col items-stretch gap-2 shrink-0">
+                <button
+                  onClick={handleCopySql}
+                  className="btn bg-amber-600 hover:bg-amber-700 text-white text-xs py-2.5 px-4 font-bold flex items-center justify-center gap-2 shadow-sm"
+                >
+                  {sqlCopied ? <Check size={15} /> : <Copy size={15} />}
+                  {sqlCopied ? 'SQL Copied to Clipboard!' : '1. Copy SQL Fix'}
+                </button>
+                <a
+                  href="https://supabase.com/dashboard/project/nsvuwjtyevhiwkxokokt/sql"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="btn bg-charcoal-900 hover:bg-charcoal-800 text-white text-xs py-2.5 px-4 font-bold flex items-center justify-center gap-2 shadow-sm"
+                >
+                  <ExternalLink size={15} />
+                  2. Open Supabase SQL Editor
+                </a>
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={runCloudHealthCheck}
+                    disabled={checkingCloudHealth}
+                    className="btn bg-white hover:bg-amber-50 text-amber-900 border border-amber-300 text-xs py-2 px-3 font-semibold flex-1 flex items-center justify-center gap-1.5"
+                  >
+                    <RefreshCw size={13} className={checkingCloudHealth ? 'animate-spin' : ''} />
+                    {checkingCloudHealth ? 'Verifying...' : '3. Re-verify Sync'}
+                  </button>
+                  <button
+                    onClick={() => setShowSqlModal(true)}
+                    className="btn bg-white hover:bg-amber-50 text-amber-900 border border-amber-300 text-xs py-2 px-3 font-semibold flex items-center justify-center gap-1"
+                  >
+                    View SQL
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {cloudHealth && cloudHealth.isHealthy && (
+          <div className="mt-6 rounded-2xl bg-leaf-500/10 border border-leaf-500/30 p-4 sm:p-5 text-charcoal-900 flex items-center justify-between gap-4 animate-fade-up">
+            <div className="flex items-center gap-3">
+              <span className="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-leaf-600 text-white shadow-sm">
+                <CheckCircle2 size={20} />
+              </span>
+              <div>
+                <p className="text-sm font-bold text-leaf-950 flex items-center gap-2">
+                  <span>Real-Time Multi-Device Sync Active</span>
+                  <span className="h-2 w-2 rounded-full bg-leaf-500 animate-pulse" />
+                </p>
+                <p className="text-xs text-leaf-800 mt-0.5">
+                  All store status overrides, menu price/stock adjustments, and gallery media are synced live to all customer devices via WebSockets.
+                </p>
+              </div>
+            </div>
+            <button
+              onClick={runCloudHealthCheck}
+              disabled={checkingCloudHealth}
+              title="Refresh connection status"
+              className="p-2 text-leaf-700 hover:bg-leaf-100 rounded-xl transition-colors shrink-0"
+            >
+              <RefreshCw size={16} className={checkingCloudHealth ? 'animate-spin' : ''} />
+            </button>
+          </div>
+        )}
+
+        {/* SQL Preview Modal */}
+        {showSqlModal && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-charcoal-950/70 backdrop-blur-sm animate-fade-in">
+            <div className="bg-white rounded-3xl max-w-3xl w-full p-6 sm:p-8 shadow-2xl flex flex-col max-h-[85vh]">
+              <div className="flex items-center justify-between border-b border-spice-200 pb-4">
+                <div className="flex items-center gap-2.5">
+                  <Database size={20} className="text-spice-600" />
+                  <h3 className="font-display font-bold text-lg text-charcoal-900">
+                    Supabase Database Real-Time Setup SQL
+                  </h3>
+                </div>
+                <button
+                  onClick={() => setShowSqlModal(false)}
+                  className="p-2 rounded-xl text-charcoal-500 hover:bg-spice-100 transition-colors"
+                >
+                  <X size={18} />
+                </button>
+              </div>
+
+              <p className="text-xs text-charcoal-600 mt-3">
+                Copy and paste this script into your Supabase SQL Editor (
+                <a
+                  href="https://supabase.com/dashboard/project/nsvuwjtyevhiwkxokokt/sql"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-spice-600 underline font-semibold"
+                >
+                  open editor
+                </a>
+                ) and click &quot;Run&quot;. This enables instant real-time sync across all customer phones!
+              </p>
+
+              <pre className="mt-4 flex-1 overflow-auto bg-charcoal-950 text-spice-100 p-4 rounded-2xl text-xs font-mono leading-relaxed border border-charcoal-800">
+                {SUPABASE_SETUP_SQL}
+              </pre>
+
+              <div className="mt-5 pt-4 border-t border-spice-200 flex justify-end gap-3">
+                <button
+                  onClick={handleCopySql}
+                  className="btn bg-spice-600 hover:bg-spice-700 text-white text-xs py-2.5 px-5 font-bold flex items-center gap-2 shadow-sm"
+                >
+                  {sqlCopied ? <Check size={15} /> : <Copy size={15} />}
+                  {sqlCopied ? 'Copied to Clipboard!' : 'Copy Entire SQL Script'}
+                </button>
+                <button
+                  onClick={() => setShowSqlModal(false)}
+                  className="btn bg-spice-100 hover:bg-spice-200 text-charcoal-800 text-xs py-2.5 px-5 font-bold"
+                >
+                  Close
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
         {/* Navigation Tabs */}
         <div className="mt-8 flex flex-wrap gap-2 border-b border-spice-200 pb-4">
           <button
@@ -1300,7 +1520,6 @@ export default function Admin({ onNavigate }: Props) {
                 </div>
 
               {/* Status Mode Banner */}
-              {/* Status Mode Banner */}
               {storeComputed.isForcedOpen ? (
                 <div className="p-4 rounded-2xl bg-leaf-50 border border-leaf-200 text-leaf-900 flex items-start gap-3">
                   <CheckCircle2 size={20} className="text-leaf-600 shrink-0 mt-0.5" />
@@ -1312,7 +1531,7 @@ export default function Admin({ onNavigate }: Props) {
                     </p>
                   </div>
                 </div>
-              ) : isClosedForToday ? (
+              ) : storeComputed.isClosedForToday ? (
                 <div className="p-4 rounded-2xl bg-amber-50 border border-amber-200 text-amber-900 flex items-start gap-3">
                   <Calendar size={20} className="text-amber-600 shrink-0 mt-0.5" />
                   <div>
@@ -1324,24 +1543,13 @@ export default function Admin({ onNavigate }: Props) {
                     </p>
                   </div>
                 </div>
-              ) : storeStatus?.override_mode === 'closed_now' ? (
-                <div className="p-4 rounded-2xl bg-red-50 border border-red-200 text-red-900 flex items-start gap-3">
-                  <Clock size={20} className="text-red-600 shrink-0 mt-0.5" />
-                  <div>
-                    <p className="font-bold text-sm">Shop is marked CLOSED NOW by Author</p>
-                    <p className="text-xs text-red-800 mt-0.5">
-                      The stall is closed right now by author override. Customers will see "Currently Closed".
-                      Click &quot;OPEN NOW&quot; or &quot;Resume Normal Schedule&quot; below to restore.
-                    </p>
-                  </div>
-                </div>
               ) : (
                 <div className="p-4 rounded-2xl bg-sky-50/80 border border-sky-200 text-sky-900 flex items-start gap-3">
                   <Clock size={20} className="text-sky-600 shrink-0 mt-0.5" />
                   <div>
                     <p className="font-bold text-sm">Automatic Schedule Active (7:30 PM – 12:00 AM IST Daily)</p>
                     <p className="text-xs text-sky-800 mt-0.5">
-                      No manual override is active. The stall opens automatically at 7:30 PM and closes at 12:00 AM
+                      No manual override is active for today. The stall opens automatically at 7:30 PM and closes at 12:00 AM
                       midnight. All other hours are automatically marked closed. (Currently {storeComputed.isOpen ? 'OPEN' : 'CLOSED'}).
                     </p>
                   </div>
@@ -1392,10 +1600,8 @@ export default function Admin({ onNavigate }: Props) {
                       CLOSED NOW
                     </span>
                     <span className="text-[11px] opacity-75">
-                      {isClosedForToday
+                      {storeComputed.isClosedForToday
                         ? 'Closed for Today (Active)'
-                        : storeStatus?.override_mode === 'closed_now'
-                        ? 'Closed Now (Author Override)'
                         : !storeComputed.isOpen
                         ? 'Currently Shut (Auto Schedule)'
                         : 'Click to close immediately'}
@@ -2593,7 +2799,7 @@ export default function Admin({ onNavigate }: Props) {
                 {feedbackList.map((f) => (
                   <div
                     key={f.id}
-                    className={`card p-6 flex flex-col justify-between space-y-4 border transition-all ${
+                    className={`card p-5 sm:p-6 flex flex-col justify-between space-y-4 border transition-all ${
                       f.approved ? 'border-leaf-400 bg-leaf-50/20 shadow-sm' : 'border-spice-200'
                     }`}
                   >
@@ -2636,7 +2842,7 @@ export default function Admin({ onNavigate }: Props) {
                       </div>
 
                       {f.message && (
-                        <p className="mt-3 text-sm text-charcoal-700 italic bg-spice-50/60 p-3 rounded-xl border border-spice-100">
+                        <p className="mt-3 text-sm text-charcoal-700 italic bg-spice-50/60 p-3 rounded-xl border border-spice-100 break-words [overflow-wrap:anywhere] whitespace-pre-line leading-relaxed">
                           "{f.message}"
                         </p>
                       )}

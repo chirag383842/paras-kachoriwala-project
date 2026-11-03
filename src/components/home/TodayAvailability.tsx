@@ -25,7 +25,7 @@ export default function TodayAvailability() {
           <div className="max-w-md mx-auto mt-4 mb-8 text-center">
             <span className="inline-flex items-center gap-1.5 rounded-full bg-spice-200/80 px-4 py-1.5 text-xs font-semibold text-charcoal-700">
               <Clock size={14} className="text-spice-600" />
-              Fresh batches will be ready at {computed.nextOpenText.replace('Opens ', '')}
+              {computed.nextOpenText}
             </span>
           </div>
         )}

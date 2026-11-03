@@ -222,9 +222,97 @@ function recordFeedback(data) {
   }
 }
 
+function getAppStateSheet() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName("AppState");
+  if (sheet) return sheet;
+  sheet = ss.insertSheet("AppState");
+  sheet.appendRow(["Key", "Value", "Updated_At"]);
+  var headerRange = sheet.getRange(1, 1, 1, 3);
+  headerRange.setFontWeight("bold");
+  headerRange.setBackground("#9c4c18");
+  headerRange.setFontColor("#ffffff");
+  return sheet;
+}
+
+function getAppState() {
+  try {
+    var sheet = getAppStateSheet();
+    var lastRow = sheet.getLastRow();
+    if (lastRow <= 1) return {};
+    var data = sheet.getRange(2, 1, lastRow - 1, 3).getValues();
+    var state = {};
+    for (var i = 0; i < data.length; i++) {
+      var key = String(data[i][0] || "").trim();
+      var val = data[i][1];
+      if (key) {
+        try {
+          state[key] = JSON.parse(val);
+        } catch (e) {
+          state[key] = val;
+        }
+      }
+    }
+    return state;
+  } catch (err) {
+    return {};
+  }
+}
+
+function saveAppStateKey(key, value) {
+  var lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(10000);
+  } catch (e) {}
+
+  try {
+    var sheet = getAppStateSheet();
+    var lastRow = sheet.getLastRow();
+    var valStr = typeof value === 'string' ? value : JSON.stringify(value);
+    var now = new Date().toISOString();
+
+    if (lastRow > 1) {
+      var data = sheet.getRange(2, 1, lastRow - 1, 1).getValues();
+      for (var i = 0; i < data.length; i++) {
+        if (String(data[i][0] || "").trim() === key) {
+          var rowIndex = i + 2;
+          sheet.getRange(rowIndex, 2).setValue(valStr);
+          sheet.getRange(rowIndex, 3).setValue(now);
+          return { status: "success", key: key, updated_at: now };
+        }
+      }
+    }
+
+    sheet.appendRow([key, valStr, now]);
+    return { status: "success", key: key, updated_at: now };
+  } finally {
+    try {
+      lock.releaseLock();
+    } catch (e) {}
+  }
+}
+
 function doPost(e) {
   try {
     var data = parsePayload(e);
+
+    // 1. Support saving application state across devices
+    if (data.action === 'saveState') {
+      if (data.key && data.value !== undefined) {
+        var res = saveAppStateKey(data.key, data.value);
+        return ContentService.createTextOutput(JSON.stringify(res))
+          .setMimeType(ContentService.MimeType.JSON);
+      }
+      if (data.state && typeof data.state === 'object') {
+        for (var k in data.state) {
+          saveAppStateKey(k, data.state[k]);
+        }
+        return ContentService.createTextOutput(JSON.stringify({ status: "success" }))
+          .setMimeType(ContentService.MimeType.JSON);
+      }
+    }
+
+    // 2. Default: record customer feedback
     var result = recordFeedback(data);
 
     return ContentService.createTextOutput(JSON.stringify(result))
@@ -238,14 +326,102 @@ function doPost(e) {
 }
 
 function doGet(e) {
-  if (e && e.parameter && (e.parameter.overall_rating || e.parameter.message)) {
-    try {
-      var result = recordFeedback(e.parameter);
-      return ContentService.createTextOutput(JSON.stringify(result))
+  if (e && e.parameter) {
+    // 1. Get Application State (for real-time multi-device sync)
+    if (e.parameter.action === 'getState' || e.parameter.action === 'state') {
+      try {
+        var state = getAppState();
+        return ContentService.createTextOutput(JSON.stringify({ status: "success", data: state }))
+          .setMimeType(ContentService.MimeType.JSON);
+      } catch (err) {
+        return ContentService.createTextOutput(JSON.stringify({ status: "error", message: err.toString() }))
+          .setMimeType(ContentService.MimeType.JSON);
+      }
+    }
+
+    // 2. Save Application State via GET (avoids CORS preflight)
+    if (e.parameter.action === 'saveState' && e.parameter.key) {
+      try {
+        var key = e.parameter.key;
+        var value = e.parameter.value;
+        try {
+          value = JSON.parse(value);
+        } catch (ex) {}
+        var saveResult = saveAppStateKey(key, value);
+        return ContentService.createTextOutput(JSON.stringify(saveResult))
+          .setMimeType(ContentService.MimeType.JSON);
+      } catch (err) {
+        return ContentService.createTextOutput(JSON.stringify({ status: "error", message: err.toString() }))
+          .setMimeType(ContentService.MimeType.JSON);
+      }
+    }
+
+    // 3. Read Customer Feedback
+    if (e.parameter.action === 'getFeedback' || e.parameter.action === 'read' || e.parameter.action === 'list') {
+      try {
+        var sheet = getTargetSheet();
+        var lastRow = sheet.getLastRow();
+        var lastCol = sheet.getLastColumn();
+        if (lastRow <= 1) {
+          return ContentService.createTextOutput(JSON.stringify({ status: "success", data: [] }))
+            .setMimeType(ContentService.MimeType.JSON);
+        }
+        var data = sheet.getRange(2, 1, lastRow - 1, lastCol).getDisplayValues();
+        var headerValues = sheet.getRange(1, 1, 1, lastCol).getDisplayValues()[0];
+        var hasRecordId = false;
+        if (headerValues[1] && headerValues[1].toLowerCase().indexOf("record") !== -1) {
+          hasRecordId = true;
+        }
+        var list = [];
+        for (var i = 0; i < data.length; i++) {
+          var row = data[i];
+          var timestamp = String(row[0] || "").trim();
+          var recordId = hasRecordId ? String(row[1] || "").trim() : "";
+          var customerName = hasRecordId ? String(row[2] || "").trim() : String(row[1] || "").trim();
+          var overallRating = Number(hasRecordId ? row[3] : row[2]) || 5;
+          var foodRating = Number(hasRecordId ? row[4] : row[3]) || 0;
+          var serviceRating = Number(hasRecordId ? row[5] : row[4]) || 0;
+          var cleanlinessRating = Number(hasRecordId ? row[6] : row[5]) || 0;
+          var message = hasRecordId ? String(row[7] || "").trim() : String(row[6] || "").trim();
+
+          if (message || customerName) {
+            list.push({
+              id: recordId || ('sheet_' + (i + 1)),
+              customer_name: customerName || 'Anonymous Customer',
+              overall_rating: overallRating,
+              food_rating: foodRating || null,
+              service_rating: serviceRating || null,
+              cleanliness_rating: cleanlinessRating || null,
+              message: message,
+              timestamp: timestamp,
+              created_at: timestamp ? new Date(timestamp).toISOString() : new Date().toISOString(),
+              approved: false
+            });
+          }
+        }
+        return ContentService.createTextOutput(JSON.stringify({ status: "success", data: list }))
+          .setMimeType(ContentService.MimeType.JSON);
+      } catch (err) {
+        return ContentService.createTextOutput(JSON.stringify({ status: "error", message: err.toString() }))
+          .setMimeType(ContentService.MimeType.JSON);
+      }
+    }
+
+    if (e.parameter.action === 'cleanupExistingDuplicates') {
+      var summary = cleanupExistingDuplicates();
+      return ContentService.createTextOutput(JSON.stringify({ status: "success", message: summary }))
         .setMimeType(ContentService.MimeType.JSON);
-    } catch (err) {
-      return ContentService.createTextOutput(JSON.stringify({ status: "error", message: err.toString() }))
-        .setMimeType(ContentService.MimeType.JSON);
+    }
+
+    if (e.parameter.overall_rating || e.parameter.message) {
+      try {
+        var result = recordFeedback(e.parameter);
+        return ContentService.createTextOutput(JSON.stringify(result))
+          .setMimeType(ContentService.MimeType.JSON);
+      } catch (err) {
+        return ContentService.createTextOutput(JSON.stringify({ status: "error", message: err.toString() }))
+          .setMimeType(ContentService.MimeType.JSON);
+      }
     }
   }
 

@@ -1,7 +1,7 @@
 -- =========================================================================
 -- PARAS KACHORIWALA: COMPLETE DATABASE & REAL-TIME MULTI-DEVICE SYNC SETUP
 -- Run this single script in your Supabase SQL Editor:
--- https://supabase.com/dashboard/project/xrvdohzqdzcunqshgqoz/sql
+-- https://supabase.com/dashboard/project/nsvuwjtyevhiwkxokokt/sql
 -- =========================================================================
 
 -- 1. Create Tables If Not Exist
@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS store_status (
 -- Ensure columns exist if table was already present
 ALTER TABLE store_status ADD COLUMN IF NOT EXISTS closed_for_date text;
 ALTER TABLE store_status ADD COLUMN IF NOT EXISTS force_open_date text;
+ALTER TABLE store_status ADD COLUMN IF NOT EXISTS override_mode text;
 
 -- Feedback & Reviews table
 CREATE TABLE IF NOT EXISTS feedback (
@@ -50,16 +51,21 @@ CREATE TABLE IF NOT EXISTS feedback (
   created_at timestamptz DEFAULT now()
 );
 
+ALTER TABLE feedback ADD COLUMN IF NOT EXISTS approved boolean NOT NULL DEFAULT true;
+
 -- Gallery table
 CREATE TABLE IF NOT EXISTS gallery (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   src text NOT NULL,
   alt text NOT NULL,
   category text NOT NULL DEFAULT 'food',
+  media_type text NOT NULL DEFAULT 'image',
   caption text,
   display_order integer NOT NULL DEFAULT 0,
   created_at timestamptz DEFAULT now()
 );
+
+ALTER TABLE gallery ADD COLUMN IF NOT EXISTS media_type text NOT NULL DEFAULT 'image';
 
 -- 2. Enable Row Level Security (RLS) on all tables
 ALTER TABLE products ENABLE ROW LEVEL SECURITY;
@@ -88,6 +94,9 @@ DROP POLICY IF EXISTS "public_read_feedback" ON feedback;
 DROP POLICY IF EXISTS "public_insert_feedback" ON feedback;
 DROP POLICY IF EXISTS "public_update_feedback" ON feedback;
 DROP POLICY IF EXISTS "public_delete_feedback" ON feedback;
+DROP POLICY IF EXISTS "public_read_approved_feedback" ON feedback;
+DROP POLICY IF EXISTS "author_read_all_feedback" ON feedback;
+DROP POLICY IF EXISTS "author_update_feedback" ON feedback;
 
 DROP POLICY IF EXISTS "allow_all_gallery" ON gallery;
 DROP POLICY IF EXISTS "public_read_gallery" ON gallery;

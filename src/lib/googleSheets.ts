@@ -1,4 +1,5 @@
 // Google Sheets Feedback Integration Service
+import type { Feedback } from './types';
 
 const GOOGLE_SHEET_URL_KEY = 'pk_google_sheet_webhook_url_v2';
 export const DEFAULT_GOOGLE_SHEET_URL =
@@ -247,3 +248,125 @@ export async function testGoogleSheetWebhook(targetUrl?: string): Promise<{ succ
     }
   }
 }
+
+/**
+ * Fetch submitted customer reviews directly from the Google Sheet
+ */
+export async function fetchFeedbackFromGoogleSheet(): Promise<Feedback[]> {
+  const webhookUrl = getGoogleSheetUrl();
+  if (!webhookUrl || webhookUrl.includes('YOUR_DEPLOYMENT_ID')) {
+    return [];
+  }
+
+  try {
+    const res = await fetch(`${webhookUrl}?action=getFeedback`, {
+      method: 'GET',
+      headers: { Accept: 'application/json' },
+    });
+    if (!res.ok) return [];
+    const text = await res.text();
+    let parsed: { status?: string; data?: unknown[] } | null = null;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      return [];
+    }
+
+    if (parsed && Array.isArray(parsed.data)) {
+      return parsed.data.map((item: Record<string, unknown>, index: number) => ({
+        id: (item.id as string) || `sheet_${index + 1}`,
+        overall_rating: Number(item.overall_rating) || 5,
+        food_rating: item.food_rating ? Number(item.food_rating) : null,
+        service_rating: item.service_rating ? Number(item.service_rating) : null,
+        cleanliness_rating: item.cleanliness_rating ? Number(item.cleanliness_rating) : null,
+        message: String(item.message || '').trim(),
+        customer_name: String(item.customer_name || 'Anonymous Customer').trim(),
+        approved: Boolean(item.approved),
+        created_at: item.timestamp ? new Date(item.timestamp as string).toISOString() : new Date().toISOString(),
+      }));
+    }
+    return [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Fetch application state (store status, menu, gallery, reviews config) from Google Sheets
+ */
+export async function fetchGlobalStateFromGoogleSheet(): Promise<Record<string, any> | null> {
+  const webhookUrl = getGoogleSheetUrl();
+  if (!webhookUrl || webhookUrl.includes('YOUR_DEPLOYMENT_ID')) {
+    return null;
+  }
+
+  try {
+    const res = await fetch(`${webhookUrl}?action=getState`, {
+      method: 'GET',
+      headers: { Accept: 'application/json' },
+    });
+    if (!res.ok) return null;
+    const text = await res.text();
+    let parsed: { status?: string; data?: Record<string, any> } | null = null;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      return null;
+    }
+    if (parsed && parsed.status === 'success' && parsed.data && typeof parsed.data === 'object') {
+      return parsed.data;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Save global state key/value to Google Sheets across all devices
+ */
+export async function saveGlobalStateToGoogleSheet(
+  key: string,
+  value: unknown
+): Promise<{ success: boolean; error?: string }> {
+  const webhookUrl = getGoogleSheetUrl();
+  if (!webhookUrl || webhookUrl.includes('YOUR_DEPLOYMENT_ID')) {
+    return { success: false, error: 'Webhook URL not configured' };
+  }
+
+  const payloadStr = typeof value === 'string' ? value : JSON.stringify(value);
+
+  // Method 1: Try GET request (works universally without CORS preflight issues)
+  try {
+    const q = new URLSearchParams({
+      action: 'saveState',
+      key,
+      value: payloadStr,
+    });
+    if (q.toString().length < 1800) {
+      await fetch(`${webhookUrl}?${q.toString()}`, {
+        method: 'GET',
+        mode: 'no-cors',
+        keepalive: true,
+      });
+      return { success: true };
+    }
+  } catch {
+    // Fall back to POST
+  }
+
+  // Method 2: POST request with text/plain to avoid preflight
+  try {
+    await fetch(webhookUrl, {
+      method: 'POST',
+      mode: 'no-cors',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify({ action: 'saveState', key, value }),
+      keepalive: true,
+    });
+    return { success: true };
+  } catch (err) {
+    return { success: false, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+

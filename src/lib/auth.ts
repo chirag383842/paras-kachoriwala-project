@@ -1,3 +1,5 @@
+import { supabase } from './supabase';
+
 // Secure Authentication Utility for Paras Kachoriwala Author/Owner portal
 
 export type AuthUser = {
@@ -20,6 +22,7 @@ const AUTHOR_EMAIL = 'jainchirag2111@gmail.com';
 const AUTHOR_PASSWORD_HASH = 'fbf5843db931a49ec4cc588d6502101ee73655a7a0f79a911e7dffae037d00c5';
 const AUTHOR_NAME = 'Chirag Jain';
 const AUTHOR_ROLE = 'Owner & Author';
+
 
 const STORAGE_SESSION_KEY = 'pk_author_auth_session_v2';
 const STORAGE_RATE_LIMIT_KEY = 'pk_auth_rate_limit';
@@ -138,6 +141,27 @@ export async function login(
       // Fallback
     }
 
+    // Bridge authentication with Supabase Auth so PostgREST operates with authenticated role
+    try {
+      const { error: sbAuthErr } = await supabase.auth.signInWithPassword({
+        email: AUTHOR_EMAIL,
+        password: cleanPass,
+      });
+      if (sbAuthErr) {
+        // If not registered in Supabase yet, sign up and retry
+        await supabase.auth.signUp({
+          email: AUTHOR_EMAIL,
+          password: cleanPass,
+        });
+        await supabase.auth.signInWithPassword({
+          email: AUTHOR_EMAIL,
+          password: cleanPass,
+        });
+      }
+    } catch {
+      // Best-effort bridge; doesn't block local login
+    }
+
     return { success: true, user };
   }
 
@@ -167,6 +191,7 @@ export async function login(
 export function logout(): void {
   try {
     localStorage.removeItem(STORAGE_SESSION_KEY);
+    void supabase.auth.signOut().catch(() => {});
     window.dispatchEvent(new Event('pk_auth_state_changed'));
   } catch {
     // Ignore

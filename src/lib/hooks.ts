@@ -2,7 +2,12 @@ import { useEffect, useState, useCallback, useRef } from 'react';
 import { supabase } from './supabase';
 import type { Product, StoreStatus, Review, Feedback, GalleryImage } from './types';
 import { DEFAULT_GALLERY_IMAGES } from './galleryData';
-import { sendFeedbackToGoogleSheet } from './googleSheets';
+import {
+  sendFeedbackToGoogleSheet,
+  fetchFeedbackFromGoogleSheet,
+  fetchGlobalStateFromGoogleSheet,
+  saveGlobalStateToGoogleSheet,
+} from './googleSheets';
 import { calculateStoreStatus } from './constants';
 import { withDedupe, invalidateCache } from './requestCache';
 import { idbGet, idbSet, idbDelete } from './mediaStorage';
@@ -158,7 +163,9 @@ const STORAGE_DELETED_PRODUCTS_KEY = 'pk_deleted_products_v5';
 const STORAGE_GALLERY_KEY = 'pk_gallery_synced_v10';
 const STORAGE_DELETED_GALLERY_KEY = 'pk_deleted_gallery_v10';
 const STORAGE_FEEDBACK_KEY = 'pk_all_feedback_records_v3';
-const STORAGE_DELETED_REVIEWS_KEY = 'pk_deleted_review_ids_v3';
+const STORAGE_DELETED_REVIEWS_KEY = 'pk_deleted_review_ids_v4';
+const STORAGE_FEATURED_REVIEWS_KEY = 'pk_featured_review_ids_v4';
+const STORAGE_UNFEATURED_REVIEWS_KEY = 'pk_unfeatured_review_ids_v4';
 
 // Actively purge all legacy cache keys from earlier app builds across all customer & admin devices
 const LEGACY_STORAGE_KEYS = [
@@ -381,7 +388,51 @@ function saveLocalFeedbackList(list: Feedback[]): void {
   }
 }
 
-function getDeletedReviewIds(): Set<string> {
+export function getFeaturedReviewIds(): Set<string> {
+  try {
+    const raw = localStorage.getItem(STORAGE_FEATURED_REVIEWS_KEY);
+    return raw ? new Set(JSON.parse(raw)) : new Set();
+  } catch {
+    return new Set();
+  }
+}
+
+export function getUnfeaturedReviewIds(): Set<string> {
+  try {
+    const raw = localStorage.getItem(STORAGE_UNFEATURED_REVIEWS_KEY);
+    return raw ? new Set(JSON.parse(raw)) : new Set();
+  } catch {
+    return new Set();
+  }
+}
+
+export function markReviewFeatured(id: string): void {
+  try {
+    const featured = getFeaturedReviewIds();
+    const unfeatured = getUnfeaturedReviewIds();
+    featured.add(id);
+    unfeatured.delete(id);
+    localStorage.setItem(STORAGE_FEATURED_REVIEWS_KEY, JSON.stringify(Array.from(featured)));
+    localStorage.setItem(STORAGE_UNFEATURED_REVIEWS_KEY, JSON.stringify(Array.from(unfeatured)));
+  } catch {
+    /* ignore */
+  }
+}
+
+export function markReviewUnfeatured(id: string): void {
+  try {
+    const featured = getFeaturedReviewIds();
+    const unfeatured = getUnfeaturedReviewIds();
+    featured.delete(id);
+    unfeatured.add(id);
+    localStorage.setItem(STORAGE_FEATURED_REVIEWS_KEY, JSON.stringify(Array.from(featured)));
+    localStorage.setItem(STORAGE_UNFEATURED_REVIEWS_KEY, JSON.stringify(Array.from(unfeatured)));
+  } catch {
+    /* ignore */
+  }
+}
+
+export function getDeletedReviewIds(): Set<string> {
   try {
     const raw = localStorage.getItem(STORAGE_DELETED_REVIEWS_KEY);
     return raw ? new Set(JSON.parse(raw)) : new Set();
@@ -390,11 +441,17 @@ function getDeletedReviewIds(): Set<string> {
   }
 }
 
-function markReviewDeleted(id: string): void {
+export function markReviewDeleted(id: string): void {
   try {
     const deleted = getDeletedReviewIds();
+    const featured = getFeaturedReviewIds();
+    const unfeatured = getUnfeaturedReviewIds();
     deleted.add(id);
+    featured.delete(id);
+    unfeatured.delete(id);
     localStorage.setItem(STORAGE_DELETED_REVIEWS_KEY, JSON.stringify(Array.from(deleted)));
+    localStorage.setItem(STORAGE_FEATURED_REVIEWS_KEY, JSON.stringify(Array.from(featured)));
+    localStorage.setItem(STORAGE_UNFEATURED_REVIEWS_KEY, JSON.stringify(Array.from(unfeatured)));
   } catch {
     /* ignore */
   }
@@ -450,31 +507,91 @@ export function useProducts() {
         'sb:products',
         async () => {
           const cached = getLocalProducts();
-          const { data, error } = await withTimeout(() =>
-            supabase
-              .from('products')
-              .select('*')
-              .order('display_order', { ascending: true }),
-            8000
-          );
+          const [sbRes, cloudState] = await Promise.all([
+            withTimeout(() =>
+              supabase
+                .from('products')
+                .select('*')
+                .order('display_order', { ascending: true }),
+              8000
+            ).catch(() => ({ data: null, error: null })),
+            fetchGlobalStateFromGoogleSheet().catch(() => null),
+          ]);
+
+          const data = sbRes.data;
+          const error = sbRes.error;
+          const deleted = getDeletedProductSlugs();
+          const baseList = memoryProducts ?? cached ?? DEFAULT_PRODUCTS;
+
+          // Merge deleted products from cloud
+          if (cloudState && Array.isArray(cloudState.deleted_products)) {
+            cloudState.deleted_products.forEach((s: string) => markProductDeleted(s));
+          }
+
+          // Merge cloud products from Google Sheets if available
+          let workingList = [...baseList];
+          if (cloudState && Array.isArray(cloudState.products) && cloudState.products.length > 0) {
+            const cloudProducts = cloudState.products as Product[];
+            const cloudMap = new Map(cloudProducts.map((p) => [p.slug || p.id, p]));
+            workingList = workingList.map((item) => {
+              const cp = cloudMap.get(item.slug) || cloudMap.get(item.id);
+              if (cp) {
+                const itemTime = item.updated_at ? new Date(item.updated_at).getTime() : 0;
+                const cpTime = cp.updated_at ? new Date(cp.updated_at).getTime() : 0;
+                if (cpTime >= itemTime) return { ...item, ...cp };
+              }
+              return item;
+            });
+            for (const cp of cloudProducts) {
+              if (!workingList.some((p) => p.slug === cp.slug || p.id === cp.id)) {
+                workingList.push(cp);
+              }
+            }
+          }
 
           if (!error && Array.isArray(data) && data.length > 0) {
             remoteLoadedRef.current = true;
             const remoteList = data as Product[];
-            memoryProducts = remoteList;
+            const remoteMap = new Map(remoteList.map((p) => [p.slug || p.id, p]));
+
+            const merged = workingList.map((localItem) => {
+              const remoteMatch = remoteMap.get(localItem.slug) || remoteMap.get(localItem.id);
+              if (remoteMatch) {
+                const localTime = localItem.updated_at ? new Date(localItem.updated_at).getTime() : 0;
+                const remoteTime = remoteMatch.updated_at ? new Date(remoteMatch.updated_at).getTime() : 0;
+                if (localTime > remoteTime && localTime > 0) {
+                  return localItem;
+                }
+                return { ...localItem, ...remoteMatch };
+              }
+              return localItem;
+            });
+
+            const existingKeys = new Set(merged.flatMap((p) => [p.slug, p.id]));
+            for (const r of remoteList) {
+              if (!existingKeys.has(r.slug) && !existingKeys.has(r.id)) {
+                merged.push(r);
+              }
+            }
+
+            const filtered = merged.filter((p) => !deleted.has(p.id) && !deleted.has(p.slug));
+            memoryProducts = filtered;
             try {
-              localStorage.setItem(STORAGE_PRODUCTS_KEY, JSON.stringify(remoteList));
+              localStorage.setItem(STORAGE_PRODUCTS_KEY, JSON.stringify(filtered));
             } catch {
               /* ignore */
             }
-            return remoteList;
+            return filtered;
           }
 
-          const deleted = getDeletedProductSlugs();
-          const baseList = (memoryProducts ?? cached ?? DEFAULT_PRODUCTS).filter(
+          const filtered = workingList.filter(
             (p) => !deleted.has(p.id) && !deleted.has(p.slug)
           );
-          return baseList;
+          memoryProducts = filtered;
+          try {
+            localStorage.setItem(STORAGE_PRODUCTS_KEY, JSON.stringify(filtered));
+          } catch {}
+          return filtered;
         },
         CACHE_TTL_SHORT
       );
@@ -685,55 +802,92 @@ export function useStoreStatus() {
         async () => {
           const cached = getLocalStatus();
           try {
-            const { data, error } = await withTimeout(() =>
-              supabase
-                .from('store_status')
-                .select('*')
-                .order('last_updated', { ascending: false })
-                .limit(1)
-                .maybeSingle()
-            );
-            if (error || !data) {
-              return cached ?? DEFAULT_STORE_STATUS;
+            const [sbRes, cloudState] = await Promise.all([
+              withTimeout(() =>
+                supabase
+                  .from('store_status')
+                  .select('*')
+                  .order('last_updated', { ascending: false })
+                  .limit(1)
+                  .maybeSingle()
+              , 8000).catch(() => ({ data: null, error: null })),
+              fetchGlobalStateFromGoogleSheet().catch(() => null),
+            ]);
+
+            const data = sbRes.data;
+            let remoteStatus: StoreStatus | null = null;
+
+            if (data && data.last_updated) {
+              // Parse any serialized metadata from updated_by if present
+              let parsedClosedDate = (data as Record<string, unknown>).closed_for_date as string | null | undefined;
+              let parsedForceOpenDate = (data as Record<string, unknown>).force_open_date as string | null | undefined;
+              let parsedOverrideMode: StoreStatus['override_mode'] = (data as Record<string, unknown>).override_mode as StoreStatus['override_mode'];
+              if (data.updated_by && typeof data.updated_by === 'string' && data.updated_by.startsWith('{')) {
+                try {
+                  const meta = JSON.parse(data.updated_by);
+                  if (meta.closed_for_date !== undefined) parsedClosedDate = meta.closed_for_date;
+                  if (meta.force_open_date !== undefined) parsedForceOpenDate = meta.force_open_date;
+                  if (meta.override_mode !== undefined) parsedOverrideMode = meta.override_mode;
+                } catch {
+                  /* ignore */
+                }
+              }
+
+              remoteStatus = {
+                id: data.id || 'store_status_main',
+                is_open: Boolean(data.is_open),
+                crowd_level: data.crowd_level || 'Moderate',
+                last_updated: data.last_updated || new Date().toISOString(),
+                closed_for_date: parsedClosedDate ?? null,
+                force_open_date: parsedForceOpenDate ?? null,
+                override_mode: parsedOverrideMode ?? null,
+                updated_by: data.updated_by,
+              };
             }
 
-            // Parse any serialized metadata from updated_by if present
-            let parsedClosedDate = (data as Record<string, unknown>).closed_for_date as string | null | undefined;
-            let parsedForceOpenDate = (data as Record<string, unknown>).force_open_date as string | null | undefined;
-            let parsedOverrideMode: StoreStatus['override_mode'] = null;
-            if (data.updated_by && typeof data.updated_by === 'string' && data.updated_by.startsWith('{')) {
-              try {
-                const meta = JSON.parse(data.updated_by);
-                if (meta.closed_for_date !== undefined) parsedClosedDate = meta.closed_for_date;
-                if (meta.force_open_date !== undefined) parsedForceOpenDate = meta.force_open_date;
-                if (meta.override_mode !== undefined) parsedOverrideMode = meta.override_mode;
-              } catch {
-                /* ignore */
+            // Google Sheets cloud state
+            let sheetStatus: StoreStatus | null = null;
+            if (cloudState && cloudState.store_status && typeof cloudState.store_status === 'object') {
+              sheetStatus = cloudState.store_status as StoreStatus;
+            }
+
+            // Determine best remote status:
+            // If Supabase row has not been updated since August 2026 (prior to RLS fix),
+            // and Google Sheets has a modern status, Google Sheets takes absolute priority!
+            let bestRemote: StoreStatus | null = null;
+            if (remoteStatus && sheetStatus) {
+              const remoteTime = new Date(remoteStatus.last_updated).getTime();
+              const sheetTime = new Date(sheetStatus.last_updated).getTime();
+              const isSupabaseStale = (remoteStatus.last_updated || '') < '2026-09-01';
+              bestRemote = isSupabaseStale ? sheetStatus : (sheetTime > remoteTime ? sheetStatus : remoteStatus);
+            } else {
+              bestRemote = sheetStatus || remoteStatus;
+            }
+
+            // Keep local status if author recently edited in this browser
+            if (cached && cached.last_updated) {
+              if (Date.now() - lastLocalStoreStatusEditTimestamp < 10_000) {
+                return cached;
+              }
+              if (bestRemote && bestRemote.last_updated) {
+                const cachedTime = new Date(cached.last_updated).getTime();
+                const bestTime = new Date(bestRemote.last_updated).getTime();
+                if (cachedTime > bestTime) {
+                  return cached;
+                }
               }
             }
 
-            const remoteStatus: StoreStatus = {
-              id: data.id || 'store_status_main',
-              is_open: Boolean(data.is_open),
-              crowd_level: data.crowd_level || 'Moderate',
-              last_updated: data.last_updated || new Date().toISOString(),
-              closed_for_date: parsedClosedDate ?? null,
-              force_open_date: parsedForceOpenDate ?? null,
-              override_mode: parsedOverrideMode ?? null,
-              updated_by: data.updated_by,
-            };
-
-            // Only prefer local cache if an author edit happened on THIS exact client tab within the last 10 seconds
-            if (Date.now() - lastLocalStoreStatusEditTimestamp < 10_000 && cached && cached.last_updated) {
-              return cached;
+            if (bestRemote) {
+              try {
+                localStorage.setItem(STORAGE_STATUS_KEY, JSON.stringify(bestRemote));
+              } catch {
+                /* ignore */
+              }
+              return bestRemote;
             }
 
-            try {
-              localStorage.setItem(STORAGE_STATUS_KEY, JSON.stringify(remoteStatus));
-            } catch {
-              /* ignore */
-            }
-            return remoteStatus;
+            return cached ?? DEFAULT_STORE_STATUS;
           } catch {
             return cached ?? DEFAULT_STORE_STATUS;
           }
@@ -865,36 +1019,72 @@ export function useGallery() {
         'sb:gallery',
         async () => {
           const deleted = getDeletedGalleryIds();
-          const { data, error } = await withTimeout(
-            () =>
-              supabase
-                .from('gallery')
-                .select('*')
-                .order('display_order', { ascending: true }),
-            10000
+          const [sbRes, cloudState] = await Promise.all([
+            withTimeout(
+              () =>
+                supabase
+                  .from('gallery')
+                  .select('*')
+                  .order('display_order', { ascending: true }),
+              8000
+            ).catch(() => ({ data: null, error: null })),
+            fetchGlobalStateFromGoogleSheet().catch(() => null),
+          ]);
+
+          const data = sbRes.data;
+          const error = sbRes.error;
+
+          // Merge deleted gallery IDs from cloud
+          if (cloudState && Array.isArray(cloudState.deleted_gallery)) {
+            cloudState.deleted_gallery.forEach((id: string) => markGalleryImageDeleted(id));
+          }
+
+          const currentLocal = (memoryGallery ?? getLocalGallery() ?? DEFAULT_GALLERY_IMAGES).filter(
+            (img) => !deleted.has(img.id)
           );
+
+          // Merge Google Sheets cloud gallery if available
+          let workingGallery = [...currentLocal];
+          if (cloudState && Array.isArray(cloudState.gallery) && cloudState.gallery.length > 0) {
+            const cloudItems = (cloudState.gallery as GalleryImage[]).map(normalizeGalleryItem);
+            const cloudMap = new Map(cloudItems.map((img) => [img.id, img]));
+            workingGallery = cloudItems;
+            for (const localImg of currentLocal) {
+              if (!cloudMap.has(localImg.id)) {
+                workingGallery.push(localImg);
+              }
+            }
+          }
 
           if (!error && Array.isArray(data) && data.length > 0) {
             remoteLoadedRef.current = true;
             const remoteFormatted = (data as GalleryImage[]).map(normalizeGalleryItem);
+            const remoteMap = new Map(remoteFormatted.map((img) => [img.id, img]));
 
-            // Supabase is the true global source of truth across all customer devices and admin
-            memoryGallery = remoteFormatted;
+            const merged = [...remoteFormatted];
+            for (const localImg of workingGallery) {
+              if (!remoteMap.has(localImg.id)) {
+                merged.push(localImg);
+              }
+            }
+            const filtered = merged.filter((img) => !deleted.has(img.id));
+            memoryGallery = filtered;
             try {
-              localStorage.setItem(STORAGE_GALLERY_KEY, JSON.stringify(remoteFormatted));
-              localStorage.removeItem(STORAGE_DELETED_GALLERY_KEY);
+              localStorage.setItem(STORAGE_GALLERY_KEY, JSON.stringify(filtered));
             } catch {
               /* ignore */
             }
-            void idbSet(STORAGE_GALLERY_KEY, remoteFormatted);
-            return remoteFormatted;
+            void idbSet(STORAGE_GALLERY_KEY, filtered);
+            return filtered;
           }
 
-          // Fallback if Supabase is offline or empty: use memory/local or defaults
-          const currentLocal = (memoryGallery ?? getLocalGallery() ?? DEFAULT_GALLERY_IMAGES).filter(
-            (img) => !deleted.has(img.id)
-          );
-          return currentLocal;
+          const filtered = workingGallery.filter((img) => !deleted.has(img.id));
+          memoryGallery = filtered;
+          try {
+            localStorage.setItem(STORAGE_GALLERY_KEY, JSON.stringify(filtered));
+          } catch {}
+          void idbSet(STORAGE_GALLERY_KEY, filtered);
+          return filtered;
         },
         CACHE_TTL_SHORT
       );
@@ -1004,56 +1194,80 @@ export function useReviews() {
 
   const fetchReviews = useCallback(async () => {
     try {
-      const deletedIds = getDeletedReviewIds();
+      // 1. Fetch from Supabase, Google Sheets global state, and Google Sheets feedback
+      const [sbRes, cloudState, sheetFeedback] = await Promise.all([
+        withTimeout(() =>
+          supabase
+            .from('feedback')
+            .select('*')
+            .order('created_at', { ascending: false })
+        , 8000).catch(() => ({ data: null })),
+        fetchGlobalStateFromGoogleSheet().catch(() => null),
+        fetchFeedbackFromGoogleSheet().catch(() => []),
+      ]);
 
-      // 1. Fetch approved from Supabase
-      const { data: supabaseFeedback } = await withTimeout(() =>
-        supabase
-          .from('feedback')
-          .select('*')
-          .eq('approved', true)
-          .order('created_at', { ascending: false })
-      ).catch(() => ({ data: null }));
-
-      // 2. Read local approved feedback
-      const localFeedback = getLocalFeedbackList().filter((f) => f.approved);
-
-      const approvedReviews: Review[] = [];
-
-      if (supabaseFeedback && supabaseFeedback.length > 0) {
-        supabaseFeedback.forEach((f, i) => {
-          if (!deletedIds.has(f.id)) {
-            approvedReviews.push({
-              id: f.id,
-              rating: f.overall_rating,
-              message: f.message || 'Delicious fresh Kachori and great taste!',
-              customer_name: f.customer_name || 'Verified Customer',
-              display_order: i + 1,
-              created_at: f.created_at,
-              source: 'verified',
-            });
-          }
-        });
+      // Synchronize featured, unfeatured, and deleted review state from cloud
+      if (cloudState && cloudState.reviews_state) {
+        const rs = cloudState.reviews_state;
+        if (Array.isArray(rs.featured)) {
+          const fSet = getFeaturedReviewIds();
+          rs.featured.forEach((id: string) => fSet.add(id));
+          localStorage.setItem(STORAGE_FEATURED_REVIEWS_KEY, JSON.stringify(Array.from(fSet)));
+        }
+        if (Array.isArray(rs.unfeatured)) {
+          const uSet = getUnfeaturedReviewIds();
+          rs.unfeatured.forEach((id: string) => uSet.add(id));
+          localStorage.setItem(STORAGE_UNFEATURED_REVIEWS_KEY, JSON.stringify(Array.from(uSet)));
+        }
+        if (Array.isArray(rs.deleted)) {
+          const dSet = getDeletedReviewIds();
+          rs.deleted.forEach((id: string) => dSet.add(id));
+          localStorage.setItem(STORAGE_DELETED_REVIEWS_KEY, JSON.stringify(Array.from(dSet)));
+        }
       }
 
-      localFeedback.forEach((f, i) => {
-        if (!deletedIds.has(f.id) && !approvedReviews.some((r) => r.id === f.id)) {
+      const deletedIds = getDeletedReviewIds();
+      const featuredIds = getFeaturedReviewIds();
+      const unfeaturedIds = getUnfeaturedReviewIds();
+
+      const candidateMap = new Map<string, Feedback>();
+      if (sbRes.data && Array.isArray(sbRes.data)) {
+        sbRes.data.forEach((item: Feedback) => candidateMap.set(item.id, item));
+      }
+      if (sheetFeedback && Array.isArray(sheetFeedback)) {
+        sheetFeedback.forEach((item: Feedback) => {
+          if (!candidateMap.has(item.id)) candidateMap.set(item.id, item);
+        });
+      }
+      getLocalFeedbackList().forEach((item) => {
+        if (!candidateMap.has(item.id)) candidateMap.set(item.id, item);
+      });
+
+      const approvedReviews: Review[] = [];
+      let orderIndex = 1;
+
+      for (const [id, f] of candidateMap.entries()) {
+        if (deletedIds.has(id)) continue;
+        if (unfeaturedIds.has(id)) continue; // explicitly unfeatured by author!
+
+        const isApproved = featuredIds.has(id) || (f.approved === true && !unfeaturedIds.has(id));
+        if (isApproved) {
           approvedReviews.push({
             id: f.id,
             rating: f.overall_rating,
             message: f.message || 'Delicious fresh Kachori and great taste!',
             customer_name: f.customer_name || 'Verified Customer',
-            display_order: i + 1,
+            display_order: orderIndex++,
             created_at: f.created_at,
             source: 'verified',
           });
         }
-      });
+      }
 
       const seenIds = new Set<string>();
       const merged: Review[] = [];
 
-      // Requirement #4: First Justdial reviews are shown
+      // Requirement: First Justdial pinned reviews
       INITIAL_PINNED_REVIEWS.forEach((r) => {
         if (!deletedIds.has(r.id) && !seenIds.has(r.id)) {
           seenIds.add(r.id);
@@ -1061,7 +1275,7 @@ export function useReviews() {
         }
       });
 
-      // Requirement #4: After that, verified reviews are shown
+      // Requirement: Verified reviews featured on homepage
       approvedReviews.forEach((r) => {
         if (!deletedIds.has(r.id) && !seenIds.has(r.id)) {
           seenIds.add(r.id);
@@ -1155,36 +1369,95 @@ export function useFeedbackList() {
 
   const fetchFeedback = useCallback(async () => {
     try {
+      // Fetch from Supabase, Google Sheet, and Cloud State in parallel
+      const [sbRes, sheetData, cloudState] = await Promise.all([
+        withTimeout(() =>
+          supabase
+            .from('feedback')
+            .select('*')
+            .order('created_at', { ascending: false })
+        , 8000).catch(() => ({ data: null, error: null })),
+        fetchFeedbackFromGoogleSheet().catch(() => []),
+        fetchGlobalStateFromGoogleSheet().catch(() => null),
+      ]);
+
+      if (cloudState && cloudState.reviews_state) {
+        const rs = cloudState.reviews_state;
+        if (Array.isArray(rs.featured)) {
+          const fSet = getFeaturedReviewIds();
+          rs.featured.forEach((id: string) => fSet.add(id));
+          localStorage.setItem(STORAGE_FEATURED_REVIEWS_KEY, JSON.stringify(Array.from(fSet)));
+        }
+        if (Array.isArray(rs.unfeatured)) {
+          const uSet = getUnfeaturedReviewIds();
+          rs.unfeatured.forEach((id: string) => uSet.add(id));
+          localStorage.setItem(STORAGE_UNFEATURED_REVIEWS_KEY, JSON.stringify(Array.from(uSet)));
+        }
+        if (Array.isArray(rs.deleted)) {
+          const dSet = getDeletedReviewIds();
+          rs.deleted.forEach((id: string) => dSet.add(id));
+          localStorage.setItem(STORAGE_DELETED_REVIEWS_KEY, JSON.stringify(Array.from(dSet)));
+        }
+      }
+
       const deletedIds = getDeletedReviewIds();
+      const featuredIds = getFeaturedReviewIds();
+      const unfeaturedIds = getUnfeaturedReviewIds();
 
-      // Fetch from Supabase
-      const { data: remoteData, error: remoteError } = await withTimeout(() =>
-        supabase
-          .from('feedback')
-          .select('*')
-          .order('created_at', { ascending: false })
-      ).catch(() => ({ data: null, error: null }));
-
+      const remoteData = sbRes.data;
       const localData = getLocalFeedbackList();
 
       const combinedMap = new Map<string, Feedback>();
+      const fingerprintMap = new Map<string, string>(); // fingerprint -> id
 
+      const makeFp = (item: Feedback) =>
+        `${(item.customer_name || '').toLowerCase().trim()}:::${(item.message || '').toLowerCase().trim()}:::${item.overall_rating}`;
+
+      const computeApproved = (item: Feedback): boolean => {
+        if (unfeaturedIds.has(item.id)) return false;
+        if (featuredIds.has(item.id)) return true;
+        return Boolean(item.approved);
+      };
+
+      // 1. Add Supabase rows
       if (remoteData && remoteData.length > 0) {
         remoteData.forEach((item: Feedback) => {
           if (!deletedIds.has(item.id)) {
-            combinedMap.set(item.id, item);
+            const row = { ...item, approved: computeApproved(item) };
+            combinedMap.set(item.id, row);
+            fingerprintMap.set(makeFp(item), item.id);
           }
         });
       }
 
+      // 2. Add Google Sheet rows (customer submissions)
+      if (sheetData && sheetData.length > 0) {
+        sheetData.forEach((item: Feedback) => {
+          if (!deletedIds.has(item.id)) {
+            const fp = makeFp(item);
+            const existingId = fingerprintMap.get(fp);
+            if (existingId && combinedMap.has(existingId)) {
+              const existing = combinedMap.get(existingId)!;
+              combinedMap.set(existingId, { ...existing, approved: computeApproved(existing) });
+            } else if (!combinedMap.has(item.id)) {
+              combinedMap.set(item.id, { ...item, approved: computeApproved(item) });
+              fingerprintMap.set(fp, item.id);
+            }
+          }
+        });
+      }
+
+      // 3. Add local rows
       localData.forEach((item) => {
         if (!deletedIds.has(item.id)) {
-          if (!combinedMap.has(item.id)) {
-            combinedMap.set(item.id, item);
+          const fp = makeFp(item);
+          const existingId = fingerprintMap.get(fp) || (combinedMap.has(item.id) ? item.id : null);
+          if (existingId && combinedMap.has(existingId)) {
+            const existing = combinedMap.get(existingId)!;
+            combinedMap.set(existingId, { ...existing, ...item, approved: computeApproved(existing) });
           } else {
-            // Keep latest approved status
-            const existing = combinedMap.get(item.id)!;
-            combinedMap.set(item.id, { ...existing, ...item });
+            combinedMap.set(item.id, { ...item, approved: computeApproved(item) });
+            fingerprintMap.set(fp, item.id);
           }
         }
       });
@@ -1316,7 +1589,7 @@ export async function submitFeedback(payload: FeedbackPayload): Promise<{ succes
   }
 
   const customerName = payload.customer_name.trim() || 'Anonymous Customer';
-  const newId = `fb_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+  const newId = generateUUID();
   const nowIso = new Date().toISOString();
 
   const newRecord: Feedback = {
@@ -1340,10 +1613,11 @@ export async function submitFeedback(payload: FeedbackPayload): Promise<{ succes
     /* ignore */
   }
 
-  // 2. Insert into Supabase
+  // 2. Insert into Supabase (without select to prevent RLS read restrictions)
   try {
-    const { data: inserted, error: sbError } = await withTimeout(() =>
+    const { error: sbError } = await withTimeout(() =>
       supabase.from('feedback').insert({
+        id: newId,
         overall_rating: overallRating,
         food_rating: payload.food_rating || null,
         service_rating: payload.service_rating || null,
@@ -1351,21 +1625,11 @@ export async function submitFeedback(payload: FeedbackPayload): Promise<{ succes
         message,
         customer_name: customerName,
         approved: false,
-      }).select().maybeSingle()
+      })
     );
 
     if (sbError) {
       console.warn('Supabase feedback insert notice:', sbError.message);
-    } else if (inserted && inserted.id) {
-      // Update local storage ID to match Supabase database ID for future admin edits
-      newRecord.id = inserted.id;
-      try {
-        const current = getLocalFeedbackList();
-        const updated = current.map((f) => (f.id === newId ? { ...f, id: inserted.id } : f));
-        saveLocalFeedbackList(updated);
-      } catch {
-        /* ignore */
-      }
     }
   } catch (err) {
     console.warn('Supabase feedback insert notice:', err);
@@ -1435,7 +1699,17 @@ export async function updateStoreStatus(status: {
   broadcastRealtimeEvent('STORE_STATUS_CHANGED', newStatus);
   window.dispatchEvent(new Event('pk_store_status_changed'));
 
-  // 2. Best-effort background remote sync to Supabase
+  // 2. Sync to Google Sheets cloud state immediately for multi-user/cross-device persistence
+  try {
+    void saveGlobalStateToGoogleSheet('store_status', newStatus);
+  } catch (sheetErr) {
+    console.warn('Google Sheets store status sync notice:', sheetErr);
+  }
+
+  let remoteSync = false;
+  let rlsBlocked = false;
+
+  // 3. Remote sync to Supabase
   try {
     const { data: existing } = await withTimeout(() =>
       supabase.from('store_status').select('id').limit(1).maybeSingle()
@@ -1447,16 +1721,17 @@ export async function updateStoreStatus(status: {
       last_updated: newStatus.last_updated,
       closed_for_date: newStatus.closed_for_date,
       force_open_date: newStatus.force_open_date,
+      override_mode: newStatus.override_mode,
       updated_by: newStatus.updated_by,
     };
 
     if (existing && existing.id) {
-      let { error } = await withTimeout(() =>
-        supabase.from('store_status').update(fullPayload).eq('id', existing.id)
+      let { data: updatedRows, error } = await withTimeout(() =>
+        supabase.from('store_status').update(fullPayload).eq('id', existing.id).select()
       );
 
-      // If columns don't exist in Supabase yet (PostgREST code 42703), fallback to standard columns
-      if (error && (error.code === '42703' || error.message?.includes('column'))) {
+      // If columns don't exist in Supabase yet (PostgREST code PGRST204 or 42703), fallback to standard columns
+      if (error && (error.code === 'PGRST204' || error.code === '42703' || error.message?.includes('column'))) {
         const fallbackPayload = {
           is_open: status.is_open,
           crowd_level: status.crowd_level,
@@ -1464,16 +1739,23 @@ export async function updateStoreStatus(status: {
           updated_by: newStatus.updated_by,
         };
         const res = await withTimeout(() =>
-          supabase.from('store_status').update(fallbackPayload).eq('id', existing.id)
+          supabase.from('store_status').update(fallbackPayload).eq('id', existing.id).select()
         );
         error = res.error;
+        updatedRows = res.data;
+      }
+
+      if (updatedRows && updatedRows.length > 0) {
+        remoteSync = true;
+      } else if (!error && (!updatedRows || updatedRows.length === 0)) {
+        rlsBlocked = true;
       }
       if (error) console.warn('Supabase remote status sync note:', error.message);
     } else {
-      let { error } = await withTimeout(() =>
-        supabase.from('store_status').insert(fullPayload)
+      let { data: insertedRows, error } = await withTimeout(() =>
+        supabase.from('store_status').insert(fullPayload).select()
       );
-      if (error && (error.code === '42703' || error.message?.includes('column'))) {
+      if (error && (error.code === 'PGRST204' || error.code === '42703' || error.message?.includes('column'))) {
         const fallbackPayload = {
           is_open: status.is_open,
           crowd_level: status.crowd_level,
@@ -1481,9 +1763,16 @@ export async function updateStoreStatus(status: {
           updated_by: newStatus.updated_by,
         };
         const res = await withTimeout(() =>
-          supabase.from('store_status').insert(fallbackPayload)
+          supabase.from('store_status').insert(fallbackPayload).select()
         );
         error = res.error;
+        insertedRows = res.data;
+      }
+
+      if (insertedRows && insertedRows.length > 0) {
+        remoteSync = true;
+      } else if (!error && (!insertedRows || insertedRows.length === 0)) {
+        rlsBlocked = true;
       }
       if (error) console.warn('Supabase remote status insert note:', error.message);
     }
@@ -1491,7 +1780,7 @@ export async function updateStoreStatus(status: {
     console.warn('Supabase remote status update notice (offline/RLS):', err);
   }
 
-  return { success: true };
+  return { success: true, remoteSync, rlsBlocked };
 }
 
 // ----------------------------------------------------
@@ -1561,6 +1850,16 @@ export async function updateProduct(
     timestamp,
   });
   window.dispatchEvent(new Event('pk_products_changed'));
+
+  // Sync to Google Sheets cloud state for all users and devices
+  try {
+    const prods = (memoryProducts ?? getLocalProducts() ?? DEFAULT_PRODUCTS).filter(
+      (p) => !getDeletedProductSlugs().has(p.id) && !getDeletedProductSlugs().has(p.slug)
+    );
+    void saveGlobalStateToGoogleSheet('products', prods);
+  } catch (sheetErr) {
+    console.warn('Google Sheets products sync notice:', sheetErr);
+  }
 
   // Await remote sync to Supabase with proper timeout so author and deployment stay 100% in sync
   let remoteSync = false;
@@ -1770,6 +2069,13 @@ export async function addProduct(
   });
   window.dispatchEvent(new Event('pk_products_changed'));
 
+  // Sync to Google Sheets cloud state for all users and devices
+  try {
+    void saveGlobalStateToGoogleSheet('products', updatedList);
+  } catch (sheetErr) {
+    console.warn('Google Sheets products sync notice:', sheetErr);
+  }
+
   return { success: true, data: newProduct };
 }
 
@@ -1808,6 +2114,17 @@ export async function deleteProduct(
   });
   window.dispatchEvent(new Event('pk_products_changed'));
 
+  // Sync to Google Sheets cloud state for all users and devices
+  try {
+    const currentProducts = memoryProducts ?? getLocalProducts() ?? DEFAULT_PRODUCTS;
+    const deleted = getDeletedProductSlugs();
+    const remaining = currentProducts.filter((p) => !deleted.has(p.id) && !deleted.has(p.slug));
+    void saveGlobalStateToGoogleSheet('products', remaining);
+    void saveGlobalStateToGoogleSheet('deleted_products', Array.from(deleted));
+  } catch (sheetErr) {
+    console.warn('Google Sheets products delete sync notice:', sheetErr);
+  }
+
   try {
     const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(productIdOrSlug);
     if (isUuid) {
@@ -1840,39 +2157,7 @@ export async function addGalleryImage(
     created_at: new Date().toISOString(),
   });
 
-  // 1. Insert into Supabase first so genuine cloud persistence is guaranteed
-  let remoteId = newId;
-  try {
-    const { data, error } = await withTimeout(() =>
-      supabase
-        .from('gallery')
-        .insert({
-          id: newId,
-          src: normalized.src,
-          alt: normalized.alt,
-          category: normalized.category,
-          caption: normalized.caption,
-          display_order: normalized.display_order,
-        })
-        .select()
-        .maybeSingle(),
-      15000
-    );
-
-    if (error) {
-      console.warn('Supabase gallery insert error:', error.message);
-      return { success: false, error: `Cloud database error: ${error.message}` };
-    }
-    if (data && data.id) {
-      remoteId = data.id;
-      normalized.id = remoteId;
-    }
-  } catch (err) {
-    console.warn('Supabase gallery insert failed:', err);
-    return { success: false, error: toErrMsg(err, 'Failed to save to cloud database') };
-  }
-
-  // 2. Persist locally after confirmed cloud insert
+  // 1. Immediately persist locally to memory, localStorage, and IndexedDB
   const current = memoryGallery ?? getLocalGallery() ?? DEFAULT_GALLERY_IMAGES;
   const updated = [normalized, ...current.filter((g) => g.id !== normalized.id)];
   memoryGallery = updated;
@@ -1887,6 +2172,40 @@ export async function addGalleryImage(
   invalidateCache('sb:gallery');
   broadcastRealtimeEvent('GALLERY_CHANGED');
   window.dispatchEvent(new Event('pk_gallery_changed'));
+
+  // Sync gallery to Google Sheets cloud state
+  try {
+    void saveGlobalStateToGoogleSheet('gallery', updated);
+  } catch (sheetErr) {
+    console.warn('Google Sheets gallery sync notice:', sheetErr);
+  }
+
+  // 2. Best-effort sync to Supabase
+  try {
+    const { data, error } = await withTimeout(() =>
+      supabase
+        .from('gallery')
+        .insert({
+          id: newId,
+          src: normalized.src,
+          alt: normalized.alt,
+          category: normalized.category,
+          caption: normalized.caption,
+          display_order: normalized.display_order,
+        })
+        .select()
+        .maybeSingle(),
+      10000
+    );
+
+    if (error) {
+      console.warn('Supabase gallery insert note:', error.message);
+    } else if (data && data.id) {
+      normalized.id = data.id;
+    }
+  } catch (err) {
+    console.warn('Supabase gallery insert notice:', err);
+  }
 
   return { success: true, data: normalized };
 }
@@ -1909,6 +2228,13 @@ export async function updateGalleryImage(
   invalidateCache('sb:gallery');
   broadcastRealtimeEvent('GALLERY_CHANGED');
   window.dispatchEvent(new Event('pk_gallery_changed'));
+
+  // Sync gallery to Google Sheets cloud state
+  try {
+    void saveGlobalStateToGoogleSheet('gallery', updated);
+  } catch (sheetErr) {
+    console.warn('Google Sheets gallery update sync notice:', sheetErr);
+  }
 
   try {
     // Supabase gallery table does not have a media_type column
@@ -1944,6 +2270,14 @@ export async function deleteGalleryImage(id: string): Promise<{ success: boolean
   broadcastRealtimeEvent('GALLERY_CHANGED', { deletedId: id });
   window.dispatchEvent(new Event('pk_gallery_changed'));
 
+  // Sync gallery and deleted_gallery to Google Sheets cloud state
+  try {
+    void saveGlobalStateToGoogleSheet('gallery', currentFiltered);
+    void saveGlobalStateToGoogleSheet('deleted_gallery', Array.from(deleted));
+  } catch (sheetErr) {
+    console.warn('Google Sheets gallery delete sync notice:', sheetErr);
+  }
+
   // Remote delete from Supabase
   try {
     const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
@@ -1974,6 +2308,13 @@ export async function clearAllGalleryImages(): Promise<{ success: boolean; error
   invalidateCache('sb:gallery');
   broadcastRealtimeEvent('GALLERY_CHANGED');
   window.dispatchEvent(new Event('pk_gallery_changed'));
+
+  // Sync gallery to Google Sheets cloud state
+  try {
+    void saveGlobalStateToGoogleSheet('gallery', []);
+  } catch (sheetErr) {
+    console.warn('Google Sheets gallery clear sync notice:', sheetErr);
+  }
 
   try {
     const { data: rows } = await withTimeout(() => supabase.from('gallery').select('id'), 10000);
@@ -2083,7 +2424,32 @@ export async function toggleApproveFeedback(
   id: string,
   approved: boolean
 ): Promise<{ success: boolean; error?: string }> {
-  // 1. Update in local storage list
+  // 1. Explicitly track featured vs unfeatured review IDs
+  if (approved) {
+    markReviewFeatured(id);
+  } else {
+    markReviewUnfeatured(id);
+  }
+
+  // Also check if there are duplicate or linked IDs with same message/customer_name
+  try {
+    const list = getLocalFeedbackList();
+    const target = list.find((f) => f.id === id);
+    if (target) {
+      const fp = `${(target.customer_name || '').toLowerCase().trim()}:::${(target.message || '').toLowerCase().trim()}:::${target.overall_rating}`;
+      list.forEach((f) => {
+        const itemFp = `${(f.customer_name || '').toLowerCase().trim()}:::${(f.message || '').toLowerCase().trim()}:::${f.overall_rating}`;
+        if (itemFp === fp) {
+          if (approved) markReviewFeatured(f.id);
+          else markReviewUnfeatured(f.id);
+        }
+      });
+    }
+  } catch {
+    /* ignore */
+  }
+
+  // 2. Update in local storage list
   try {
     const list = getLocalFeedbackList();
     const updated = list.map((f) => (f.id === id ? { ...f, approved } : f));
@@ -2092,18 +2458,49 @@ export async function toggleApproveFeedback(
     /* ignore */
   }
 
-  // 2. Broadcast immediately
+  // 3. Broadcast immediately
   invalidateCache('sb:reviews');
   broadcastRealtimeEvent('REVIEW_APPROVED_TOGGLED', { id, approved });
   window.dispatchEvent(new Event('pk_reviews_changed'));
 
-  // 3. Update Supabase
+  // 4. Sync reviews_state to Google Sheets cloud state for all users and devices
+  try {
+    void saveGlobalStateToGoogleSheet('reviews_state', {
+      featured: Array.from(getFeaturedReviewIds()),
+      unfeatured: Array.from(getUnfeaturedReviewIds()),
+      deleted: Array.from(getDeletedReviewIds()),
+    });
+  } catch (sheetErr) {
+    console.warn('Google Sheets review approve sync notice:', sheetErr);
+  }
+
+  // 5. Update Supabase
   try {
     const { error } = await withTimeout(() =>
       supabase.from('feedback').update({ approved }).eq('id', id)
     );
     if (error) {
       console.warn('Supabase toggle feedback notice:', error.message);
+    }
+
+    if (approved) {
+      const target = getLocalFeedbackList().find((f) => f.id === id);
+      if (target) {
+        const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
+        const rowId = isUuid ? id : generateUUID();
+        await withTimeout(() =>
+          supabase.from('feedback').insert({
+            id: rowId,
+            overall_rating: target.overall_rating,
+            food_rating: target.food_rating,
+            service_rating: target.service_rating,
+            cleanliness_rating: target.cleanliness_rating,
+            message: target.message,
+            customer_name: target.customer_name,
+            approved: true,
+          })
+        ).catch(() => {});
+      }
     }
   } catch (err) {
     console.warn('Supabase toggle feedback notice:', err);
@@ -2115,6 +2512,23 @@ export async function toggleApproveFeedback(
 export async function deleteFeedback(feedbackId: string): Promise<{ success: boolean; error?: string }> {
   // 1. Permanently mark deleted locally
   markReviewDeleted(feedbackId);
+
+  // Also check if there are duplicate or linked IDs with same message/customer_name
+  try {
+    const list = getLocalFeedbackList();
+    const target = list.find((f) => f.id === feedbackId);
+    if (target) {
+      const fp = `${(target.customer_name || '').toLowerCase().trim()}:::${(target.message || '').toLowerCase().trim()}:::${target.overall_rating}`;
+      list.forEach((f) => {
+        const itemFp = `${(f.customer_name || '').toLowerCase().trim()}:::${(f.message || '').toLowerCase().trim()}:::${f.overall_rating}`;
+        if (itemFp === fp) {
+          markReviewDeleted(f.id);
+        }
+      });
+    }
+  } catch {
+    /* ignore */
+  }
 
   // 2. Remove from local feedback records
   try {
@@ -2130,7 +2544,18 @@ export async function deleteFeedback(feedbackId: string): Promise<{ success: boo
   broadcastRealtimeEvent('REVIEW_DELETED', { id: feedbackId });
   window.dispatchEvent(new Event('pk_reviews_changed'));
 
-  // 4. Delete from Supabase
+  // 4. Sync reviews_state to Google Sheets cloud state for all users and devices
+  try {
+    void saveGlobalStateToGoogleSheet('reviews_state', {
+      featured: Array.from(getFeaturedReviewIds()),
+      unfeatured: Array.from(getUnfeaturedReviewIds()),
+      deleted: Array.from(getDeletedReviewIds()),
+    });
+  } catch (sheetErr) {
+    console.warn('Google Sheets review delete sync notice:', sheetErr);
+  }
+
+  // 5. Delete from Supabase
   try {
     const { error } = await withTimeout(() =>
       supabase.from('feedback').delete().eq('id', feedbackId)
@@ -2143,4 +2568,85 @@ export async function deleteFeedback(feedbackId: string): Promise<{ success: boo
   }
 
   return { success: true };
+}
+
+// ----------------------------------------------------
+// 12. DATABASE & REAL-TIME CLOUD HEALTH DIAGNOSTIC
+// ----------------------------------------------------
+export type SupabaseHealthStatus = {
+  isHealthy: boolean;
+  storeStatusWritable: boolean;
+  productsWritable: boolean;
+  galleryTableExists: boolean;
+  feedbackWritable: boolean;
+  errorMessage?: string;
+};
+
+export async function checkSupabaseHealth(): Promise<SupabaseHealthStatus> {
+  let storeStatusWritable = false;
+  let productsWritable = false;
+  let galleryTableExists = false;
+  let feedbackWritable = false;
+  let errorMessage = '';
+
+  try {
+    // 1. Check store_status write permission
+    const { data: statusRows, error: sErr } = await supabase.from('store_status').select('id, last_updated').limit(1);
+    if (!sErr && statusRows && statusRows.length > 0) {
+      const { data: updatedRows, error: updateErr } = await supabase
+        .from('store_status')
+        .update({ last_updated: statusRows[0].last_updated })
+        .eq('id', statusRows[0].id)
+        .select();
+      if (!updateErr && updatedRows && updatedRows.length > 0) {
+        storeStatusWritable = true;
+      }
+    }
+
+    // 2. Check products write permission
+    const { data: prodRows, error: pErr } = await supabase.from('products').select('id, price').limit(1);
+    if (!pErr && prodRows && prodRows.length > 0) {
+      const { data: updatedProd, error: prodErr } = await supabase
+        .from('products')
+        .update({ price: prodRows[0].price })
+        .eq('id', prodRows[0].id)
+        .select();
+      if (!prodErr && updatedProd && updatedProd.length > 0) {
+        productsWritable = true;
+      }
+    }
+
+    // 3. Check gallery table existence
+    const { error: galErr } = await supabase.from('gallery').select('id').limit(1);
+    if (!galErr) {
+      galleryTableExists = true;
+    }
+
+    // 4. Check feedback write permission
+    const { data: fbRows, error: fbErr } = await supabase.from('feedback').select('id, approved').limit(1);
+    if (!fbErr && fbRows && fbRows.length > 0) {
+      const { data: updatedFb, error: fbUpdateErr } = await supabase
+        .from('feedback')
+        .update({ approved: fbRows[0].approved })
+        .eq('id', fbRows[0].id)
+        .select();
+      if (!fbUpdateErr && updatedFb && updatedFb.length > 0) {
+        feedbackWritable = true;
+      }
+    } else if (!fbErr) {
+      feedbackWritable = true;
+    }
+  } catch (err) {
+    errorMessage = err instanceof Error ? err.message : String(err);
+  }
+
+  const isHealthy = storeStatusWritable && productsWritable && galleryTableExists && feedbackWritable;
+  return {
+    isHealthy,
+    storeStatusWritable,
+    productsWritable,
+    galleryTableExists,
+    feedbackWritable,
+    errorMessage,
+  };
 }

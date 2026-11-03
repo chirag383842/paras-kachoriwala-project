@@ -72,39 +72,40 @@ export default function Directions() {
                   Official Stall Location
                 </span>
               </div>
-              <span className="absolute bottom-5 left-5 right-5 flex items-center justify-between gap-3 rounded-2xl bg-white/95 px-4 py-3 text-sm font-bold text-spice-700 shadow-xl group-hover:bg-marigold-400 group-hover:text-charcoal-950 transition-colors">
-                <span className="flex items-center gap-2">
-                  <Navigation size={18} />
-                  Open Live Pin in Google Maps
+              <span className="absolute bottom-3 sm:bottom-4 md:bottom-5 left-3 sm:left-4 md:left-5 right-3 sm:right-4 md:right-5 flex items-center justify-between gap-2 rounded-xl sm:rounded-2xl bg-white/95 px-3.5 py-2.5 sm:px-4 sm:py-3 text-xs sm:text-sm font-bold text-spice-700 shadow-xl group-hover:bg-marigold-400 group-hover:text-charcoal-950 transition-colors">
+                <span className="flex items-center gap-2 min-w-0">
+                  <Navigation size={16} className="shrink-0 sm:h-[18px] sm:w-[18px]" />
+                  <span className="truncate sm:overflow-visible">Open Live Pin in Google Maps</span>
                 </span>
-                <ExternalLink size={16} />
+                <ExternalLink size={15} className="shrink-0 sm:h-4 sm:w-4" />
               </span>
             </a>
 
-            <div className="p-6 sm:p-7 flex flex-col gap-4">
+            <div className="p-5 sm:p-7 flex flex-col gap-4">
               <div className="flex items-start justify-between gap-4">
                 <div>
-                  <h3 className="font-display text-xl font-bold text-charcoal-900">{BRAND.name}</h3>
-                  <p className="text-sm text-charcoal-600 mt-1">{BRAND.address}</p>
+                  <h3 className="font-display text-lg sm:text-xl font-bold text-charcoal-900">{BRAND.name}</h3>
+                  <p className="text-xs sm:text-sm text-charcoal-600 mt-1 leading-relaxed break-words">{BRAND.address}</p>
                 </div>
               </div>
 
-              <div className="flex flex-wrap gap-2 pt-2 border-t border-spice-100">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 pt-3 border-t border-spice-100">
                 <button
+                  type="button"
                   onClick={handleCopyAddress}
-                  className="btn-outline text-xs py-2 px-3 flex items-center gap-1.5"
+                  className="btn-outline text-xs sm:text-sm py-2.5 px-3 flex items-center justify-center gap-1.5 w-full font-bold shadow-sm cursor-pointer"
                 >
-                  {copied ? <Check size={14} className="text-leaf-600" /> : <Copy size={14} />}
-                  {copied ? 'Address Copied!' : 'Copy Address'}
+                  {copied ? <Check size={15} className="text-leaf-600 shrink-0" /> : <Copy size={15} className="shrink-0" />}
+                  <span>{copied ? 'Address Copied!' : 'Copy Address'}</span>
                 </button>
                 <a
                   href={BRAND.mapsLink}
                   target="_blank"
                   rel="noopener noreferrer"
-                  className="btn-primary text-xs py-2 px-3.5 flex items-center gap-1.5 ml-auto"
+                  className="btn-primary text-xs sm:text-sm py-2.5 px-3.5 flex items-center justify-center gap-1.5 w-full font-bold shadow-sm"
                 >
-                  <Navigation size={14} />
-                  Start Navigation
+                  <Navigation size={15} className="shrink-0" />
+                  <span>Start Navigation</span>
                 </a>
               </div>
             </div>

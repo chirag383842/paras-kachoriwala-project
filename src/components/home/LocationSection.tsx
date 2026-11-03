@@ -33,21 +33,24 @@ export default function LocationSection() {
               loading="lazy"
             />
             <div className="absolute inset-0 bg-gradient-to-t from-charcoal-950/75 via-charcoal-950/10 to-transparent" />
-            <span className="absolute bottom-5 left-5 right-5 flex items-center justify-between gap-3 rounded-2xl bg-white/95 px-4 py-3 text-sm font-bold text-spice-700 shadow-lg">
-              <span>Open exact map pin</span>
-              <Navigation size={18} />
+            <span className="absolute bottom-3 sm:bottom-4 md:bottom-5 left-3 sm:left-4 md:left-5 right-3 sm:right-4 md:right-5 flex items-center justify-between gap-2 rounded-xl sm:rounded-2xl bg-white/95 px-3.5 py-2.5 sm:px-4 sm:py-3 text-xs sm:text-sm font-bold text-spice-700 shadow-lg group-hover:bg-marigold-400 group-hover:text-charcoal-950 transition-colors">
+              <span className="flex items-center gap-2 min-w-0">
+                <Navigation size={16} className="shrink-0 sm:h-[18px] sm:w-[18px]" />
+                <span className="truncate sm:overflow-visible">Open Live Pin in Google Maps</span>
+              </span>
+              <Navigation size={15} className="shrink-0 sm:h-4 sm:w-4 rotate-45" />
             </span>
           </a>
         </div>
 
-        <div className="card p-7 sm:p-9 flex flex-col">
+        <div className="card p-5 sm:p-7 md:p-9 flex flex-col">
           <div className="flex items-start gap-4">
             <span className="grid h-12 w-12 shrink-0 place-items-center rounded-2xl bg-spice-100 text-spice-700">
               <MapPin size={22} />
             </span>
             <div>
               <h3 className="font-display text-xl font-bold text-charcoal-900">Our Location</h3>
-              <p className="mt-1 text-charcoal-600">{BRAND.address}</p>
+              <p className="mt-1 text-xs sm:text-sm text-charcoal-600 leading-relaxed break-words">{BRAND.address}</p>
             </div>
           </div>
 

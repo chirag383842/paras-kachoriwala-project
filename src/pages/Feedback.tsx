@@ -107,15 +107,15 @@ export default function Feedback() {
           </p>
         </div>
 
-        <form onSubmit={handleSubmit} className="mt-12 max-w-2xl mx-auto card p-7 sm:p-10 space-y-8" noValidate>
+        <form onSubmit={handleSubmit} className="mt-8 sm:mt-12 max-w-2xl mx-auto card p-5 sm:p-8 md:p-10 space-y-6 sm:space-y-8" noValidate>
           {RATING_FIELDS.map((f) => (
             <div key={f.key}>
-              <label className="block text-sm font-bold text-charcoal-800 mb-3">
+              <label className="block text-sm font-bold text-charcoal-800 mb-2 sm:mb-3">
                 {f.label} <span className="text-spice-600" aria-hidden>*</span>
               </label>
               <StarRating
                 value={ratings[f.key]}
-                size={32}
+                size={28}
                 interactive
                 onChange={(v) => setRatings((r) => ({ ...r, [f.key]: v }))}
               />
@@ -128,16 +128,20 @@ export default function Feedback() {
           ))}
 
           <div>
-            <label htmlFor="message" className="block text-sm font-bold text-charcoal-800 mb-2">
-              Your Feedback <span className="text-spice-600" aria-hidden>*</span>
-            </label>
+            <div className="flex items-center justify-between gap-2 mb-2">
+              <label htmlFor="message" className="block text-sm font-bold text-charcoal-800">
+                Your Feedback <span className="text-spice-600" aria-hidden>*</span>
+              </label>
+              <span className="text-xs text-charcoal-400 font-medium">
+                {message.length}/1000
+              </span>
+            </div>
             <textarea
               id="message"
               value={message}
               onChange={(e) => setMessage(e.target.value)}
-              rows={4}
-              placeholder="Tell us about your experience at Paras Kachoriwala..."
-              className="w-full rounded-2xl border border-spice-200 bg-spice-50/50 px-4 py-3 text-charcoal-900 placeholder:text-charcoal-400 focus:border-spice-500 focus:bg-white transition-colors resize-none"
+              placeholder="Tell us about your experience at Paras Kachoriwala (taste, service, favorites)..."
+              className="w-full min-h-[140px] sm:min-h-[160px] rounded-2xl border border-spice-200 bg-spice-50/50 p-3.5 sm:p-4 text-base sm:text-sm text-charcoal-900 placeholder:text-charcoal-400 focus:border-spice-500 focus:bg-white transition-colors resize-y leading-relaxed break-words"
               maxLength={1000}
             />
             {touched && !messageValid && (
@@ -145,7 +149,6 @@ export default function Feedback() {
                 <AlertCircle size={14} /> Please share a few words (at least 5 characters).
               </p>
             )}
-            <p className="mt-1.5 text-xs text-charcoal-400 text-right">{message.length}/1000</p>
           </div>
 
           <div>
