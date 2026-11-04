@@ -57,7 +57,7 @@ export default function Feedback() {
         setStatus('error');
         setErrorMsg(result.error ?? 'Something went wrong. Please try again.');
       }
-    } catch (err) {
+    } catch {
       setStatus('error');
       setErrorMsg('Network error. Please try again.');
     } finally {

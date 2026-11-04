@@ -208,7 +208,6 @@ if (typeof window !== 'undefined') {
 }
 
 const CACHE_TTL_SHORT = 4_000;
-const CACHE_TTL_MEDIUM = 8_000;
 const REQUEST_TIMEOUT_MS = 8_000;
 
 // Cross-tab Real-Time Broadcast Channel
@@ -590,7 +589,9 @@ export function useProducts() {
           memoryProducts = filtered;
           try {
             localStorage.setItem(STORAGE_PRODUCTS_KEY, JSON.stringify(filtered));
-          } catch {}
+          } catch {
+            /* ignore */
+          }
           return filtered;
         },
         CACHE_TTL_SHORT
@@ -851,30 +852,16 @@ export function useStoreStatus() {
               sheetStatus = cloudState.store_status as StoreStatus;
             }
 
-            // Determine best remote status:
-            // If Supabase row has not been updated since August 2026 (prior to RLS fix),
-            // and Google Sheets has a modern status, Google Sheets takes absolute priority!
-            let bestRemote: StoreStatus | null = null;
-            if (remoteStatus && sheetStatus) {
-              const remoteTime = new Date(remoteStatus.last_updated).getTime();
-              const sheetTime = new Date(sheetStatus.last_updated).getTime();
-              const isSupabaseStale = (remoteStatus.last_updated || '') < '2026-09-01';
-              bestRemote = isSupabaseStale ? sheetStatus : (sheetTime > remoteTime ? sheetStatus : remoteStatus);
-            } else {
-              bestRemote = sheetStatus || remoteStatus;
-            }
+            // Supabase is the single source of truth.
+            // Google Sheets is a best-effort mirror and is only used as a
+            // fallback when Supabase has no usable row at all.
+            const bestRemote: StoreStatus | null = remoteStatus || sheetStatus;
 
-            // Keep local status if author recently edited in this browser
+            // Keep local status briefly if the author just edited in this browser
+            // (guards the small window before the confirmed remote row is fetched).
             if (cached && cached.last_updated) {
               if (Date.now() - lastLocalStoreStatusEditTimestamp < 10_000) {
                 return cached;
-              }
-              if (bestRemote && bestRemote.last_updated) {
-                const cachedTime = new Date(cached.last_updated).getTime();
-                const bestTime = new Date(bestRemote.last_updated).getTime();
-                if (cachedTime > bestTime) {
-                  return cached;
-                }
               }
             }
 
@@ -1082,7 +1069,9 @@ export function useGallery() {
           memoryGallery = filtered;
           try {
             localStorage.setItem(STORAGE_GALLERY_KEY, JSON.stringify(filtered));
-          } catch {}
+          } catch {
+            /* ignore */
+          }
           void idbSet(STORAGE_GALLERY_KEY, filtered);
           return filtered;
         },
@@ -1208,7 +1197,7 @@ export function useReviews() {
 
       // Synchronize featured, unfeatured, and deleted review state from cloud
       if (cloudState && cloudState.reviews_state) {
-        const rs = cloudState.reviews_state;
+        const rs = cloudState.reviews_state as { featured?: unknown; unfeatured?: unknown; deleted?: unknown };
         if (Array.isArray(rs.featured)) {
           const fSet = getFeaturedReviewIds();
           rs.featured.forEach((id: string) => fSet.add(id));
@@ -1382,7 +1371,7 @@ export function useFeedbackList() {
       ]);
 
       if (cloudState && cloudState.reviews_state) {
-        const rs = cloudState.reviews_state;
+        const rs = cloudState.reviews_state as { featured?: unknown; unfeatured?: unknown; deleted?: unknown };
         if (Array.isArray(rs.featured)) {
           const fSet = getFeaturedReviewIds();
           rs.featured.forEach((id: string) => fSet.add(id));
@@ -1667,8 +1656,7 @@ export async function updateStoreStatus(status: {
   closed_for_date?: string | null;
   force_open_date?: string | null;
   override_mode?: 'force_open' | 'force_close' | 'closed_now' | 'closed_today' | null;
-}): Promise<{ success: boolean; error?: string }> {
-  lastLocalStoreStatusEditTimestamp = Date.now();
+}): Promise<{ success: boolean; error?: string; remoteSync?: boolean; rlsBlocked?: boolean }> {
   const timestamp = new Date().toISOString();
   const metaObj = {
     closed_for_date: status.closed_for_date ?? null,
@@ -1688,7 +1676,89 @@ export async function updateStoreStatus(status: {
     updated_by: JSON.stringify(metaObj),
   };
 
-  // 1. Immediately persist locally and broadcast so UI and all open tabs respond instantaneously
+  const fullPayload: Record<string, unknown> = {
+    is_open: status.is_open,
+    crowd_level: status.crowd_level,
+    last_updated: newStatus.last_updated,
+    closed_for_date: newStatus.closed_for_date,
+    force_open_date: newStatus.force_open_date,
+    override_mode: newStatus.override_mode,
+    updated_by: newStatus.updated_by,
+  };
+
+  // 1. Supabase is the single source of truth: write to the database FIRST and
+  //    only report success once the database has actually confirmed the change.
+  let remoteSync = false;
+  let rlsBlocked = false;
+  let remoteError: string | undefined;
+
+  try {
+    const { data: existing, error: selectError } = await withTimeout(() =>
+      supabase.from('store_status').select('id').limit(1).maybeSingle()
+    );
+    if (selectError) {
+      return {
+        success: false,
+        error: `Could not read shop status from the database: ${selectError.message}`,
+        remoteSync: false,
+      };
+    }
+
+    const writeRow = (payload: Record<string, unknown>) => {
+      if (existing && existing.id) {
+        return withTimeout(() =>
+          supabase.from('store_status').update(payload).eq('id', existing.id).select('id')
+        );
+      }
+      return withTimeout(() => supabase.from('store_status').insert(payload).select('id'));
+    };
+
+    let rows: Array<{ id: string }> | null = null;
+    let error: { code?: string; message?: string } | null = null;
+    {
+      const res = await writeRow(fullPayload);
+      rows = res.data as Array<{ id: string }> | null;
+      error = res.error;
+    }
+
+    // Graceful fallback only if the override columns have not been migrated yet.
+    if (error && (error.code === 'PGRST204' || error.code === '42703' || error.message?.includes('column'))) {
+      const fallbackPayload = {
+        is_open: status.is_open,
+        crowd_level: status.crowd_level,
+        last_updated: newStatus.last_updated,
+        updated_by: newStatus.updated_by,
+      };
+      const res = await writeRow(fallbackPayload);
+      rows = res.data as Array<{ id: string }> | null;
+      error = res.error;
+    }
+
+    if (error) {
+      remoteError = error.message;
+    } else if (rows && rows.length > 0) {
+      remoteSync = true;
+    } else {
+      rlsBlocked = true;
+    }
+  } catch (err) {
+    remoteError = toErrMsg(err, 'Unable to reach the database.');
+  }
+
+  if (!remoteSync) {
+    return {
+      success: false,
+      error: rlsBlocked
+        ? 'The database did not accept the update (permission/RLS blocked). Run the Supabase fix script, then try again.'
+        : remoteError || 'The update could not be saved to the database. Please try again.',
+      remoteSync: false,
+      rlsBlocked,
+    };
+  }
+
+  // 2. The database confirmed the change — now update local cache, notify other
+  //    tabs, and mirror to Google Sheets (best-effort mirror only, never authoritative).
+  lastLocalStoreStatusEditTimestamp = Date.now();
   try {
     localStorage.setItem(STORAGE_STATUS_KEY, JSON.stringify(newStatus));
   } catch {
@@ -1699,88 +1769,13 @@ export async function updateStoreStatus(status: {
   broadcastRealtimeEvent('STORE_STATUS_CHANGED', newStatus);
   window.dispatchEvent(new Event('pk_store_status_changed'));
 
-  // 2. Sync to Google Sheets cloud state immediately for multi-user/cross-device persistence
   try {
     void saveGlobalStateToGoogleSheet('store_status', newStatus);
   } catch (sheetErr) {
-    console.warn('Google Sheets store status sync notice:', sheetErr);
+    console.warn('Google Sheets store status mirror notice:', sheetErr);
   }
 
-  let remoteSync = false;
-  let rlsBlocked = false;
-
-  // 3. Remote sync to Supabase
-  try {
-    const { data: existing } = await withTimeout(() =>
-      supabase.from('store_status').select('id').limit(1).maybeSingle()
-    );
-
-    const fullPayload: Record<string, unknown> = {
-      is_open: status.is_open,
-      crowd_level: status.crowd_level,
-      last_updated: newStatus.last_updated,
-      closed_for_date: newStatus.closed_for_date,
-      force_open_date: newStatus.force_open_date,
-      override_mode: newStatus.override_mode,
-      updated_by: newStatus.updated_by,
-    };
-
-    if (existing && existing.id) {
-      let { data: updatedRows, error } = await withTimeout(() =>
-        supabase.from('store_status').update(fullPayload).eq('id', existing.id).select()
-      );
-
-      // If columns don't exist in Supabase yet (PostgREST code PGRST204 or 42703), fallback to standard columns
-      if (error && (error.code === 'PGRST204' || error.code === '42703' || error.message?.includes('column'))) {
-        const fallbackPayload = {
-          is_open: status.is_open,
-          crowd_level: status.crowd_level,
-          last_updated: newStatus.last_updated,
-          updated_by: newStatus.updated_by,
-        };
-        const res = await withTimeout(() =>
-          supabase.from('store_status').update(fallbackPayload).eq('id', existing.id).select()
-        );
-        error = res.error;
-        updatedRows = res.data;
-      }
-
-      if (updatedRows && updatedRows.length > 0) {
-        remoteSync = true;
-      } else if (!error && (!updatedRows || updatedRows.length === 0)) {
-        rlsBlocked = true;
-      }
-      if (error) console.warn('Supabase remote status sync note:', error.message);
-    } else {
-      let { data: insertedRows, error } = await withTimeout(() =>
-        supabase.from('store_status').insert(fullPayload).select()
-      );
-      if (error && (error.code === 'PGRST204' || error.code === '42703' || error.message?.includes('column'))) {
-        const fallbackPayload = {
-          is_open: status.is_open,
-          crowd_level: status.crowd_level,
-          last_updated: newStatus.last_updated,
-          updated_by: newStatus.updated_by,
-        };
-        const res = await withTimeout(() =>
-          supabase.from('store_status').insert(fallbackPayload).select()
-        );
-        error = res.error;
-        insertedRows = res.data;
-      }
-
-      if (insertedRows && insertedRows.length > 0) {
-        remoteSync = true;
-      } else if (!error && (!insertedRows || insertedRows.length === 0)) {
-        rlsBlocked = true;
-      }
-      if (error) console.warn('Supabase remote status insert note:', error.message);
-    }
-  } catch (err) {
-    console.warn('Supabase remote status update notice (offline/RLS):', err);
-  }
-
-  return { success: true, remoteSync, rlsBlocked };
+  return { success: true, remoteSync: true, rlsBlocked: false };
 }
 
 // ----------------------------------------------------
@@ -1904,7 +1899,9 @@ export async function updateProduct(
         memoryProducts = updated;
         try {
           localStorage.setItem(STORAGE_PRODUCTS_KEY, JSON.stringify(updated));
-        } catch {}
+        } catch {
+          /* ignore */
+        }
       } else if (error) {
         remoteError = error.message;
       }
@@ -1934,7 +1931,9 @@ export async function updateProduct(
         memoryProducts = updated;
         try {
           localStorage.setItem(STORAGE_PRODUCTS_KEY, JSON.stringify(updated));
-        } catch {}
+        } catch {
+          /* ignore */
+        }
       } else if (error) {
         remoteError = error.message;
       }
@@ -1977,7 +1976,9 @@ export async function updateProduct(
         memoryProducts = updated;
         try {
           localStorage.setItem(STORAGE_PRODUCTS_KEY, JSON.stringify(updated));
-        } catch {}
+        } catch {
+          /* ignore */
+        }
       } else if (error) {
         remoteError = error.message;
       }
@@ -1987,7 +1988,16 @@ export async function updateProduct(
     remoteError = toErrMsg(err);
   }
 
-  return { success: true, remoteSync, error: remoteSync ? undefined : remoteError };
+  // Supabase is authoritative: only report success once the database confirmed.
+  if (!remoteSync) {
+    return {
+      success: false,
+      remoteSync: false,
+      error: remoteError || 'The product change could not be saved to the database. Please try again.',
+    };
+  }
+
+  return { success: true, remoteSync: true };
 }
 
 export async function addProduct(
@@ -2008,7 +2018,9 @@ export async function addProduct(
   unmarkProductDeleted(slug);
   unmarkProductDeleted(createdId);
 
-  // Insert into Supabase so we obtain the genuine Supabase UUID
+  // Supabase is authoritative: insert first and only continue once it is stored.
+  let remoteSync = false;
+  let remoteError = '';
   try {
     const { data, error } = await withTimeout(
       () =>
@@ -2032,9 +2044,19 @@ export async function addProduct(
     );
     if (!error && data?.id) {
       createdId = data.id;
+      remoteSync = true;
+    } else if (error) {
+      remoteError = error.message;
     }
   } catch (err) {
-    console.warn('Supabase product insert notice:', err);
+    remoteError = toErrMsg(err, 'Unable to reach the database.');
+  }
+
+  if (!remoteSync) {
+    return {
+      success: false,
+      error: remoteError || 'The product could not be added to the database. Please try again.',
+    };
   }
 
   const newProduct: Product = {
@@ -2083,6 +2105,46 @@ export async function deleteProduct(
   productIdOrSlug: string
 ): Promise<{ success: boolean; error?: string }> {
   const timestamp = new Date().toISOString();
+  const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(productIdOrSlug);
+  const column = isUuid ? 'id' : 'slug';
+
+  // Supabase is authoritative: delete from the database first, then verify.
+  let remoteSync = false;
+  let remoteError = '';
+  try {
+    const { error } = await withTimeout(
+      () => supabase.from('products').delete().eq(column, productIdOrSlug).select('id'),
+      8000
+    );
+    if (error) {
+      remoteError = error.message;
+    } else {
+      // RLS can silently block deletes, so confirm the row is actually gone.
+      const { data: stillThere, error: verifyErr } = await withTimeout(
+        () => supabase.from('products').select('id').eq(column, productIdOrSlug).maybeSingle(),
+        8000
+      );
+      if (verifyErr) {
+        remoteError = verifyErr.message;
+      } else if (stillThere) {
+        remoteError =
+          'The database did not delete this product (permission/RLS blocked). Run the Supabase fix script, then try again.';
+      } else {
+        remoteSync = true;
+      }
+    }
+  } catch (err) {
+    remoteError = toErrMsg(err, 'Unable to reach the database.');
+  }
+
+  if (!remoteSync) {
+    return {
+      success: false,
+      error: remoteError || 'The product could not be deleted from the database. Please try again.',
+    };
+  }
+
+  // The database confirmed the delete — now update local state and notify tabs.
   try {
     markProductDeleted(productIdOrSlug);
     const currentProducts = memoryProducts ?? getLocalProducts() ?? DEFAULT_PRODUCTS;
@@ -2114,7 +2176,7 @@ export async function deleteProduct(
   });
   window.dispatchEvent(new Event('pk_products_changed'));
 
-  // Sync to Google Sheets cloud state for all users and devices
+  // Google Sheets is a best-effort mirror only.
   try {
     const currentProducts = memoryProducts ?? getLocalProducts() ?? DEFAULT_PRODUCTS;
     const deleted = getDeletedProductSlugs();
@@ -2123,17 +2185,6 @@ export async function deleteProduct(
     void saveGlobalStateToGoogleSheet('deleted_products', Array.from(deleted));
   } catch (sheetErr) {
     console.warn('Google Sheets products delete sync notice:', sheetErr);
-  }
-
-  try {
-    const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(productIdOrSlug);
-    if (isUuid) {
-      await withTimeout(() => supabase.from('products').delete().eq('id', productIdOrSlug), 8000);
-    } else {
-      await withTimeout(() => supabase.from('products').delete().eq('slug', productIdOrSlug), 8000);
-    }
-  } catch (err) {
-    console.warn('Remote sync delete product notice:', err);
   }
 
   return { success: true };
@@ -2157,7 +2208,44 @@ export async function addGalleryImage(
     created_at: new Date().toISOString(),
   });
 
-  // 1. Immediately persist locally to memory, localStorage, and IndexedDB
+  // Supabase is authoritative: insert first and only continue once it is stored.
+  let remoteSync = false;
+  let remoteError = '';
+  try {
+    const { data, error } = await withTimeout(
+      () =>
+        supabase
+          .from('gallery')
+          .insert({
+            id: newId,
+            src: normalized.src,
+            alt: normalized.alt,
+            category: normalized.category,
+            caption: normalized.caption,
+            display_order: normalized.display_order,
+          })
+          .select()
+          .maybeSingle(),
+      10000
+    );
+    if (!error && data?.id) {
+      normalized.id = data.id;
+      remoteSync = true;
+    } else if (error) {
+      remoteError = error.message;
+    }
+  } catch (err) {
+    remoteError = toErrMsg(err, 'Unable to reach the database.');
+  }
+
+  if (!remoteSync) {
+    return {
+      success: false,
+      error: remoteError || 'The media could not be saved to the database. Please try again.',
+    };
+  }
+
+  // 2. The database confirmed the insert — now persist locally, notify tabs and mirror.
   const current = memoryGallery ?? getLocalGallery() ?? DEFAULT_GALLERY_IMAGES;
   const updated = [normalized, ...current.filter((g) => g.id !== normalized.id)];
   memoryGallery = updated;
@@ -2173,38 +2261,11 @@ export async function addGalleryImage(
   broadcastRealtimeEvent('GALLERY_CHANGED');
   window.dispatchEvent(new Event('pk_gallery_changed'));
 
-  // Sync gallery to Google Sheets cloud state
+  // Google Sheets is a best-effort mirror only.
   try {
     void saveGlobalStateToGoogleSheet('gallery', updated);
   } catch (sheetErr) {
     console.warn('Google Sheets gallery sync notice:', sheetErr);
-  }
-
-  // 2. Best-effort sync to Supabase
-  try {
-    const { data, error } = await withTimeout(() =>
-      supabase
-        .from('gallery')
-        .insert({
-          id: newId,
-          src: normalized.src,
-          alt: normalized.alt,
-          category: normalized.category,
-          caption: normalized.caption,
-          display_order: normalized.display_order,
-        })
-        .select()
-        .maybeSingle(),
-      10000
-    );
-
-    if (error) {
-      console.warn('Supabase gallery insert note:', error.message);
-    } else if (data && data.id) {
-      normalized.id = data.id;
-    }
-  } catch (err) {
-    console.warn('Supabase gallery insert notice:', err);
   }
 
   return { success: true, data: normalized };
@@ -2214,6 +2275,40 @@ export async function updateGalleryImage(
   id: string,
   updates: Partial<GalleryImage>
 ): Promise<{ success: boolean; error?: string }> {
+  // Supabase gallery table does not have a media_type column
+  const { media_type, ...supabaseUpdates } = updates as Record<string, unknown>;
+  void media_type;
+
+  // Supabase is authoritative: write to the database first.
+  if (Object.keys(supabaseUpdates).length > 0) {
+    let remoteSync = false;
+    let remoteError = '';
+    try {
+      const { data, error } = await withTimeout(
+        () => supabase.from('gallery').update(supabaseUpdates).eq('id', id).select('id'),
+        8000
+      );
+      if (error) {
+        remoteError = error.message;
+      } else if (data && data.length > 0) {
+        remoteSync = true;
+      } else {
+        remoteError =
+          'The database did not accept the gallery update (permission/RLS blocked). Run the Supabase fix script, then try again.';
+      }
+    } catch (err) {
+      remoteError = toErrMsg(err, 'Unable to reach the database.');
+    }
+
+    if (!remoteSync) {
+      return {
+        success: false,
+        error: remoteError || 'The gallery update could not be saved to the database. Please try again.',
+      };
+    }
+  }
+
+  // The database confirmed the change — now persist locally and notify tabs.
   const current = memoryGallery ?? getLocalGallery() ?? DEFAULT_GALLERY_IMAGES;
   const updated = current.map((img) => (img.id === id ? { ...img, ...updates } : img));
   memoryGallery = updated;
@@ -2229,33 +2324,79 @@ export async function updateGalleryImage(
   broadcastRealtimeEvent('GALLERY_CHANGED');
   window.dispatchEvent(new Event('pk_gallery_changed'));
 
-  // Sync gallery to Google Sheets cloud state
+  // Google Sheets is a best-effort mirror only.
   try {
     void saveGlobalStateToGoogleSheet('gallery', updated);
   } catch (sheetErr) {
     console.warn('Google Sheets gallery update sync notice:', sheetErr);
   }
 
-  try {
-    // Supabase gallery table does not have a media_type column
-    const { media_type, ...supabaseUpdates } = updates as Record<string, unknown>;
-    if (Object.keys(supabaseUpdates).length > 0) {
-      await withTimeout(() => supabase.from('gallery').update(supabaseUpdates).eq('id', id), 8000);
-    }
-  } catch (err) {
-    console.warn('Gallery update notice:', err);
-  }
-
   return { success: true };
 }
 
 export async function deleteGalleryImage(id: string): Promise<{ success: boolean; error?: string }> {
-  markGalleryImageDeleted(id);
-  const deleted = getDeletedGalleryIds();
-
-  // Find image in local state so we have its src as a fallback delete selector
   const current = memoryGallery ?? getLocalGallery() ?? DEFAULT_GALLERY_IMAGES;
   const targetImg = current.find((img) => img.id === id);
+  const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
+
+  // Supabase is authoritative: delete from the database first and verify.
+  let remoteSync = false;
+  let remoteError = '';
+  try {
+    if (isUuid) {
+      const { error } = await withTimeout(
+        () => supabase.from('gallery').delete().eq('id', id).select('id'),
+        10000
+      );
+      if (error) {
+        remoteError = error.message;
+      } else {
+        const { data: still, error: vErr } = await withTimeout(
+          () => supabase.from('gallery').select('id').eq('id', id).maybeSingle(),
+          8000
+        );
+        if (vErr) remoteError = vErr.message;
+        else if (still) {
+          remoteError =
+            'The database did not delete this media (permission/RLS blocked). Run the Supabase fix script, then try again.';
+        } else remoteSync = true;
+      }
+    } else if (targetImg?.src) {
+      const { error } = await withTimeout(
+        () => supabase.from('gallery').delete().eq('src', targetImg.src).select('id'),
+        10000
+      );
+      if (error) {
+        remoteError = error.message;
+      } else {
+        const { data: still, error: vErr } = await withTimeout(
+          () => supabase.from('gallery').select('id').eq('src', targetImg.src).limit(1),
+          8000
+        );
+        if (vErr) remoteError = vErr.message;
+        else if (still && still.length > 0) {
+          remoteError =
+            'The database did not delete this media (permission/RLS blocked). Run the Supabase fix script, then try again.';
+        } else remoteSync = true;
+      }
+    } else {
+      // Nothing to delete remotely.
+      remoteSync = true;
+    }
+  } catch (err) {
+    remoteError = toErrMsg(err, 'Unable to reach the database.');
+  }
+
+  if (!remoteSync) {
+    return {
+      success: false,
+      error: remoteError || 'The media could not be deleted from the database. Please try again.',
+    };
+  }
+
+  // The database confirmed the delete — now update local state and notify tabs.
+  markGalleryImageDeleted(id);
+  const deleted = getDeletedGalleryIds();
   const currentFiltered = current.filter((img) => img.id !== id && !deleted.has(img.id));
   memoryGallery = currentFiltered;
 
@@ -2270,7 +2411,7 @@ export async function deleteGalleryImage(id: string): Promise<{ success: boolean
   broadcastRealtimeEvent('GALLERY_CHANGED', { deletedId: id });
   window.dispatchEvent(new Event('pk_gallery_changed'));
 
-  // Sync gallery and deleted_gallery to Google Sheets cloud state
+  // Google Sheets is a best-effort mirror only.
   try {
     void saveGlobalStateToGoogleSheet('gallery', currentFiltered);
     void saveGlobalStateToGoogleSheet('deleted_gallery', Array.from(deleted));
@@ -2278,24 +2419,53 @@ export async function deleteGalleryImage(id: string): Promise<{ success: boolean
     console.warn('Google Sheets gallery delete sync notice:', sheetErr);
   }
 
-  // Remote delete from Supabase
-  try {
-    const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
-    if (isUuid) {
-      const { error } = await withTimeout(() => supabase.from('gallery').delete().eq('id', id), 10000);
-      if (error) console.warn('Supabase delete gallery by id error:', error.message);
-    } else if (targetImg?.src) {
-      const { error } = await withTimeout(() => supabase.from('gallery').delete().eq('src', targetImg.src), 10000);
-      if (error) console.warn('Supabase delete gallery by src error:', error.message);
-    }
-  } catch (err) {
-    console.warn('Gallery remote delete notice:', err);
-  }
-
   return { success: true };
 }
 
 export async function clearAllGalleryImages(): Promise<{ success: boolean; error?: string }> {
+  // Supabase is authoritative: clear the database first and verify it is empty.
+  let remoteSync = false;
+  let remoteError = '';
+  try {
+    const { data: rows, error } = await withTimeout(() => supabase.from('gallery').select('id'), 10000);
+    if (error) {
+      remoteError = error.message;
+    } else {
+      let deleteFailed = false;
+      for (const r of rows || []) {
+        const { error: dErr } = await withTimeout(
+          () => supabase.from('gallery').delete().eq('id', r.id).select('id'),
+          8000
+        );
+        if (dErr) {
+          deleteFailed = true;
+          remoteError = dErr.message;
+        }
+      }
+      if (!deleteFailed) {
+        const { data: remaining, error: vErr } = await withTimeout(
+          () => supabase.from('gallery').select('id').limit(1),
+          8000
+        );
+        if (vErr) remoteError = vErr.message;
+        else if (remaining && remaining.length > 0) {
+          remoteError =
+            'The database did not clear the gallery (permission/RLS blocked). Run the Supabase fix script, then try again.';
+        } else remoteSync = true;
+      }
+    }
+  } catch (err) {
+    remoteError = toErrMsg(err, 'Unable to reach the database.');
+  }
+
+  if (!remoteSync) {
+    return {
+      success: false,
+      error: remoteError || 'The gallery could not be cleared in the database. Please try again.',
+    };
+  }
+
+  // The database confirmed the clear — now update local state and notify tabs.
   memoryGallery = [];
   try {
     localStorage.setItem(STORAGE_GALLERY_KEY, JSON.stringify([]));
@@ -2309,22 +2479,11 @@ export async function clearAllGalleryImages(): Promise<{ success: boolean; error
   broadcastRealtimeEvent('GALLERY_CHANGED');
   window.dispatchEvent(new Event('pk_gallery_changed'));
 
-  // Sync gallery to Google Sheets cloud state
+  // Google Sheets is a best-effort mirror only.
   try {
     void saveGlobalStateToGoogleSheet('gallery', []);
   } catch (sheetErr) {
     console.warn('Google Sheets gallery clear sync notice:', sheetErr);
-  }
-
-  try {
-    const { data: rows } = await withTimeout(() => supabase.from('gallery').select('id'), 10000);
-    if (rows && rows.length > 0) {
-      for (const r of rows) {
-        await withTimeout(() => supabase.from('gallery').delete().eq('id', r.id), 8000).catch(() => {});
-      }
-    }
-  } catch (err) {
-    console.warn('Clear all gallery Supabase notice:', err);
   }
 
   return { success: true };
@@ -2424,6 +2583,66 @@ export async function toggleApproveFeedback(
   id: string,
   approved: boolean
 ): Promise<{ success: boolean; error?: string }> {
+  // Supabase is authoritative: write to the database first and only report
+  // success once the database has confirmed the change.
+  let remoteSync = false;
+  let remoteError = '';
+  try {
+    const { data, error } = await withTimeout(
+      () => supabase.from('feedback').update({ approved }).eq('id', id).select('id'),
+      8000
+    );
+    if (error) {
+      remoteError = error.message;
+    } else if (data && data.length > 0) {
+      remoteSync = true;
+    } else if (approved) {
+      // The review is not in the database yet (local-only review) — insert it.
+      const target = getLocalFeedbackList().find((f) => f.id === id);
+      if (target) {
+        const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
+        const rowId = isUuid ? id : generateUUID();
+        const { data: inserted, error: insErr } = await withTimeout(
+          () =>
+            supabase
+              .from('feedback')
+              .insert({
+                id: rowId,
+                overall_rating: target.overall_rating,
+                food_rating: target.food_rating,
+                service_rating: target.service_rating,
+                cleanliness_rating: target.cleanliness_rating,
+                message: target.message,
+                customer_name: target.customer_name,
+                approved: true,
+              })
+              .select('id')
+              .maybeSingle(),
+          8000
+        );
+        if (!insErr && inserted?.id) {
+          remoteSync = true;
+        } else if (insErr) {
+          remoteError = insErr.message;
+        }
+      } else {
+        remoteError = 'This review could not be found in the database.';
+      }
+    } else {
+      // Un-approving a review that is not stored in the database: nothing to persist.
+      remoteSync = true;
+    }
+  } catch (err) {
+    remoteError = toErrMsg(err, 'Unable to reach the database.');
+  }
+
+  if (!remoteSync) {
+    return {
+      success: false,
+      error: remoteError || 'The review could not be updated in the database. Please try again.',
+    };
+  }
+
   // 1. Explicitly track featured vs unfeatured review IDs
   if (approved) {
     markReviewFeatured(id);
@@ -2463,7 +2682,7 @@ export async function toggleApproveFeedback(
   broadcastRealtimeEvent('REVIEW_APPROVED_TOGGLED', { id, approved });
   window.dispatchEvent(new Event('pk_reviews_changed'));
 
-  // 4. Sync reviews_state to Google Sheets cloud state for all users and devices
+  // 4. Google Sheets is a best-effort mirror only.
   try {
     void saveGlobalStateToGoogleSheet('reviews_state', {
       featured: Array.from(getFeaturedReviewIds()),
@@ -2474,42 +2693,47 @@ export async function toggleApproveFeedback(
     console.warn('Google Sheets review approve sync notice:', sheetErr);
   }
 
-  // 5. Update Supabase
-  try {
-    const { error } = await withTimeout(() =>
-      supabase.from('feedback').update({ approved }).eq('id', id)
-    );
-    if (error) {
-      console.warn('Supabase toggle feedback notice:', error.message);
-    }
-
-    if (approved) {
-      const target = getLocalFeedbackList().find((f) => f.id === id);
-      if (target) {
-        const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
-        const rowId = isUuid ? id : generateUUID();
-        await withTimeout(() =>
-          supabase.from('feedback').insert({
-            id: rowId,
-            overall_rating: target.overall_rating,
-            food_rating: target.food_rating,
-            service_rating: target.service_rating,
-            cleanliness_rating: target.cleanliness_rating,
-            message: target.message,
-            customer_name: target.customer_name,
-            approved: true,
-          })
-        ).catch(() => {});
-      }
-    }
-  } catch (err) {
-    console.warn('Supabase toggle feedback notice:', err);
-  }
-
   return { success: true };
 }
 
 export async function deleteFeedback(feedbackId: string): Promise<{ success: boolean; error?: string }> {
+  // Supabase is authoritative: delete from the database first and verify.
+  let remoteSync = false;
+  let remoteError = '';
+  try {
+    const { error } = await withTimeout(
+      () => supabase.from('feedback').delete().eq('id', feedbackId).select('id'),
+      8000
+    );
+    if (error) {
+      remoteError = error.message;
+    } else {
+      // RLS can silently block deletes, so confirm the row is actually gone.
+      const { data: still, error: vErr } = await withTimeout(
+        () => supabase.from('feedback').select('id').eq('id', feedbackId).maybeSingle(),
+        8000
+      );
+      if (vErr) {
+        remoteError = vErr.message;
+      } else if (still) {
+        remoteError =
+          'The database did not delete this review (permission/RLS blocked). Run the Supabase fix script, then try again.';
+      } else {
+        remoteSync = true;
+      }
+    }
+  } catch (err) {
+    remoteError = toErrMsg(err, 'Unable to reach the database.');
+  }
+
+  if (!remoteSync) {
+    return {
+      success: false,
+      error: remoteError || 'The review could not be deleted from the database. Please try again.',
+    };
+  }
+
+  // The database confirmed the delete — now update local state and notify tabs.
   // 1. Permanently mark deleted locally
   markReviewDeleted(feedbackId);
 
@@ -2544,7 +2768,7 @@ export async function deleteFeedback(feedbackId: string): Promise<{ success: boo
   broadcastRealtimeEvent('REVIEW_DELETED', { id: feedbackId });
   window.dispatchEvent(new Event('pk_reviews_changed'));
 
-  // 4. Sync reviews_state to Google Sheets cloud state for all users and devices
+  // 4. Google Sheets is a best-effort mirror only.
   try {
     void saveGlobalStateToGoogleSheet('reviews_state', {
       featured: Array.from(getFeaturedReviewIds()),
@@ -2553,18 +2777,6 @@ export async function deleteFeedback(feedbackId: string): Promise<{ success: boo
     });
   } catch (sheetErr) {
     console.warn('Google Sheets review delete sync notice:', sheetErr);
-  }
-
-  // 5. Delete from Supabase
-  try {
-    const { error } = await withTimeout(() =>
-      supabase.from('feedback').delete().eq('id', feedbackId)
-    );
-    if (error) {
-      console.warn('Supabase delete feedback notice:', error.message);
-    }
-  } catch (err) {
-    console.warn('Supabase delete feedback notice:', err);
   }
 
   return { success: true };

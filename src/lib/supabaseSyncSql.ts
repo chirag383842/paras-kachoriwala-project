@@ -1,7 +1,7 @@
 export const SUPABASE_SETUP_SQL = `-- =========================================================================
 -- PARAS KACHORIWALA: COMPLETE DATABASE & REAL-TIME MULTI-DEVICE SYNC SETUP
 -- Run this single script in your Supabase SQL Editor:
--- https://supabase.com/dashboard/project/nsvuwjtyevhiwkxokokt/sql
+-- https://supabase.com/dashboard/project/xrvdohzqdzcunqshgqoz/sql
 -- =========================================================================
 
 -- 1. Create Tables If Not Exist

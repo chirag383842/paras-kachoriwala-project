@@ -5,7 +5,6 @@ import {
   Store,
   Users,
   IndianRupee,
-  Package,
   Save,
   CheckCircle2,
   XCircle,
@@ -28,15 +27,9 @@ import {
   Star,
   Folder,
   Utensils,
-  BookOpen,
-  Home as HomeIcon,
   Camera,
   Video,
-  Play,
-  Film,
   Music,
-  Sparkles,
-  Leaf,
   Database,
   Copy,
   ExternalLink,
@@ -96,7 +89,7 @@ export default function Admin({ onNavigate }: Props) {
 
   // Status management state
   const { data: storeStatus, computed: storeComputed, error: storeStatusError, refetch: refetchStoreStatus } = useStoreStatus();
-  const [isOpen, setIsOpen] = useState(true);
+  const [, setIsOpen] = useState(true);
   const [crowd, setCrowd] = useState<CrowdLevel>('Moderate');
   const [statusSaving, setStatusSaving] = useState(false);
   const [statusMessage, setStatusMessage] = useState('');
@@ -490,21 +483,7 @@ export default function Admin({ onNavigate }: Props) {
       [product.id]: updatedEntry,
     }));
 
-    // 2. Immediately show confirmation banner on screen
-    const liveMsg = newAvailable
-      ? `Live Website: ${product.name} is now marked IN STOCK!`
-      : `Live Website: ${product.name} is now marked SOLD OUT!`;
-
-    setProductMessages((prev) => ({
-      ...prev,
-      [product.slug]: liveMsg,
-      [product.id]: liveMsg,
-    }));
-    setTimeout(() => {
-      setProductMessages((prev) => ({ ...prev, [product.slug]: '', [product.id]: '' }));
-    }, 4000);
-
-    // 3. Immediately save locally, broadcast to user website, and sync to Supabase
+    // 2. Save to Supabase first — the database is the single source of truth.
     const res = await updateProduct(
       product.id,
       {
@@ -518,7 +497,25 @@ export default function Admin({ onNavigate }: Props) {
 
     if (res.success) {
       await refetchProducts();
+      // 3. Only report success once the database confirmed the change.
+      const liveMsg = newAvailable
+        ? `Live Website: ${product.name} is now marked IN STOCK!`
+        : `Live Website: ${product.name} is now marked SOLD OUT!`;
+      setProductMessages((prev) => ({
+        ...prev,
+        [product.slug]: liveMsg,
+        [product.id]: liveMsg,
+      }));
+    } else {
+      setProductMessages((prev) => ({
+        ...prev,
+        [product.slug]: `⚠ Update failed: ${res.error || 'Please try again'}`,
+        [product.id]: `⚠ Update failed: ${res.error || 'Please try again'}`,
+      }));
     }
+    setTimeout(() => {
+      setProductMessages((prev) => ({ ...prev, [product.slug]: '', [product.id]: '' }));
+    }, 4000);
   };
 
   const handleSaveProduct = async (product: Product) => {
@@ -594,7 +591,7 @@ export default function Admin({ onNavigate }: Props) {
       [product.id]: priceMsg,
     }));
 
-    // 3. Immediately broadcast to website & save in background
+    // 3. Save to Supabase first — the database is the single source of truth.
     const res = await updateProduct(
       product.id,
       {
@@ -608,17 +605,19 @@ export default function Admin({ onNavigate }: Props) {
 
     if (res.success) {
       await refetchProducts();
+      const successMsg = `✓ Live: ${product.name} price saved to ₹${priceToSave} & updated across all devices!`;
+      setProductMessages((prev) => ({
+        ...prev,
+        [product.slug]: successMsg,
+        [product.id]: successMsg,
+      }));
+    } else {
+      setProductMessages((prev) => ({
+        ...prev,
+        [product.slug]: `⚠ Update failed: ${res.error || 'Please try again'}`,
+        [product.id]: `⚠ Update failed: ${res.error || 'Please try again'}`,
+      }));
     }
-
-    const successMsg = res.remoteSync
-      ? `✓ Live: ${product.name} price saved to ₹${priceToSave} & updated across all devices!`
-      : `Live: ${product.name} price updated to ₹${priceToSave}!`;
-
-    setProductMessages((prev) => ({
-      ...prev,
-      [product.slug]: successMsg,
-      [product.id]: successMsg,
-    }));
     setTimeout(() => {
       setProductMessages((prev) => ({ ...prev, [product.slug]: '', [product.id]: '' }));
     }, 3500);
@@ -669,9 +668,10 @@ export default function Admin({ onNavigate }: Props) {
       } else {
         alert(res.error || 'Failed to update product photo.');
       }
-    } catch (err: any) {
+    } catch (err) {
       console.error('Error optimizing product photo:', err);
-      alert('Could not process photo: ' + (err.message || 'Please try another photo.'));
+      const msg = err instanceof Error && err.message ? err.message : 'Please try another photo.';
+      alert('Could not process photo: ' + msg);
     } finally {
       setProductImageUploading((prev) => ({
         ...prev,
@@ -733,8 +733,9 @@ export default function Admin({ onNavigate }: Props) {
     try {
       const optimized = await optimizeImageForProduct(file, 800, 0.85);
       setNewMenuItem((prev) => ({ ...prev, image_url: optimized }));
-    } catch (err: any) {
-      alert('Could not process photo: ' + (err.message || 'Please try another photo.'));
+    } catch (err) {
+      const msg = err instanceof Error && err.message ? err.message : 'Please try another photo.';
+      alert('Could not process photo: ' + msg);
     } finally {
       setNewMenuPhotoUploading(false);
       if (newMenuPhotoInputRef.current) newMenuPhotoInputRef.current.value = '';
@@ -829,8 +830,8 @@ export default function Admin({ onNavigate }: Props) {
       } else {
         setAddMenuError(res.error || 'Unable to add menu item. Please try again.');
       }
-    } catch (err: any) {
-      setAddMenuError(err?.message || 'Error processing menu addition.');
+    } catch (err) {
+      setAddMenuError(err instanceof Error && err.message ? err.message : 'Error processing menu addition.');
     } finally {
       setIsAddingMenu(false);
     }
@@ -847,6 +848,8 @@ export default function Admin({ onNavigate }: Props) {
     const res = await deleteProduct(product.id || product.slug);
     if (res.success) {
       refetchProducts();
+    } else {
+      alert(res.error || 'Failed to delete this product from the database. Please try again.');
     }
   };
 
@@ -944,7 +947,11 @@ export default function Admin({ onNavigate }: Props) {
 
   const handleDeleteGalleryImage = async (id: string) => {
     if (!confirm('Are you sure you want to delete this photo from the website gallery?')) return;
-    await deleteGalleryImage(id);
+    const res = await deleteGalleryImage(id);
+    if (!res.success) {
+      alert(res.error || 'Failed to delete this media from the database. Please try again.');
+      return;
+    }
     await syncAuthorGalleryToSupabase();
     refetchGallery();
   };
@@ -958,8 +965,13 @@ export default function Admin({ onNavigate }: Props) {
       return;
     setSyncingGallery(true);
     setGallerySyncMsg('');
-    await clearAllGalleryImages();
+    const res = await clearAllGalleryImages();
     setSyncingGallery(false);
+    if (!res.success) {
+      setGallerySyncMsg(`Error: ${res.error || 'Could not clear the gallery. Please try again.'}`);
+      setTimeout(() => setGallerySyncMsg(''), 6000);
+      return;
+    }
     setGallerySyncMsg('All gallery items deleted successfully. Gallery is now a clean slate!');
     setTimeout(() => setGallerySyncMsg(''), 5000);
     refetchGallery();
@@ -1012,7 +1024,12 @@ export default function Admin({ onNavigate }: Props) {
     try {
       const dataUrl = await optimizeGalleryMedia(file);
       const mediaType: 'image' | 'video' | 'audio' = isVideo ? 'video' : isAudio ? 'audio' : 'image';
-      await updateGalleryImage(replacingId, { src: dataUrl, media_type: mediaType });
+      const res = await updateGalleryImage(replacingId, { src: dataUrl, media_type: mediaType });
+      if (!res.success) {
+        alert(res.error || 'Failed to replace this media in the database. Please try again.');
+        setReplacingId(null);
+        return;
+      }
       await syncAuthorGalleryToSupabase();
       refetchGallery();
       setReplacingId(null);
@@ -1022,7 +1039,12 @@ export default function Admin({ onNavigate }: Props) {
       reader.onload = async (loadEvt) => {
         const dataUrl = loadEvt.target?.result as string;
         const mediaType: 'image' | 'video' | 'audio' = isVideo ? 'video' : isAudio ? 'audio' : 'image';
-        await updateGalleryImage(replacingId, { src: dataUrl, media_type: mediaType });
+        const res = await updateGalleryImage(replacingId, { src: dataUrl, media_type: mediaType });
+        if (!res.success) {
+          alert(res.error || 'Failed to replace this media in the database. Please try again.');
+          setReplacingId(null);
+          return;
+        }
         await syncAuthorGalleryToSupabase();
         refetchGallery();
         setReplacingId(null);
@@ -1033,7 +1055,11 @@ export default function Admin({ onNavigate }: Props) {
   };
 
   const handleChangeImageCategory = async (id: string, newCategory: GalleryImage['category']) => {
-    await updateGalleryImage(id, { category: newCategory });
+    const res = await updateGalleryImage(id, { category: newCategory });
+    if (!res.success) {
+      alert(res.error || 'Failed to update this media in the database. Please try again.');
+      return;
+    }
     await syncAuthorGalleryToSupabase();
     refetchGallery();
   };
@@ -1334,7 +1360,7 @@ export default function Admin({ onNavigate }: Props) {
                   {sqlCopied ? 'SQL Copied to Clipboard!' : '1. Copy SQL Fix'}
                 </button>
                 <a
-                  href="https://supabase.com/dashboard/project/nsvuwjtyevhiwkxokokt/sql"
+                  href="https://supabase.com/dashboard/project/xrvdohzqdzcunqshgqoz/sql"
                   target="_blank"
                   rel="noopener noreferrer"
                   className="btn bg-charcoal-900 hover:bg-charcoal-800 text-white text-xs py-2.5 px-4 font-bold flex items-center justify-center gap-2 shadow-sm"
@@ -1412,7 +1438,7 @@ export default function Admin({ onNavigate }: Props) {
               <p className="text-xs text-charcoal-600 mt-3">
                 Copy and paste this script into your Supabase SQL Editor (
                 <a
-                  href="https://supabase.com/dashboard/project/nsvuwjtyevhiwkxokokt/sql"
+                  href="https://supabase.com/dashboard/project/xrvdohzqdzcunqshgqoz/sql"
                   target="_blank"
                   rel="noopener noreferrer"
                   className="text-spice-600 underline font-semibold"

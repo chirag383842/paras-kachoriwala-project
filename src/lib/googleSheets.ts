@@ -273,17 +273,20 @@ export async function fetchFeedbackFromGoogleSheet(): Promise<Feedback[]> {
     }
 
     if (parsed && Array.isArray(parsed.data)) {
-      return parsed.data.map((item: Record<string, unknown>, index: number) => ({
-        id: (item.id as string) || `sheet_${index + 1}`,
-        overall_rating: Number(item.overall_rating) || 5,
-        food_rating: item.food_rating ? Number(item.food_rating) : null,
-        service_rating: item.service_rating ? Number(item.service_rating) : null,
-        cleanliness_rating: item.cleanliness_rating ? Number(item.cleanliness_rating) : null,
-        message: String(item.message || '').trim(),
-        customer_name: String(item.customer_name || 'Anonymous Customer').trim(),
-        approved: Boolean(item.approved),
-        created_at: item.timestamp ? new Date(item.timestamp as string).toISOString() : new Date().toISOString(),
-      }));
+      return parsed.data.map((raw: unknown, index: number) => {
+        const item = raw as Record<string, unknown>;
+        return {
+          id: (item.id as string) || `sheet_${index + 1}`,
+          overall_rating: Number(item.overall_rating) || 5,
+          food_rating: item.food_rating ? Number(item.food_rating) : null,
+          service_rating: item.service_rating ? Number(item.service_rating) : null,
+          cleanliness_rating: item.cleanliness_rating ? Number(item.cleanliness_rating) : null,
+          message: String(item.message || '').trim(),
+          customer_name: String(item.customer_name || 'Anonymous Customer').trim(),
+          approved: Boolean(item.approved),
+          created_at: item.timestamp ? new Date(item.timestamp as string).toISOString() : new Date().toISOString(),
+        };
+      });
     }
     return [];
   } catch {
@@ -294,7 +297,7 @@ export async function fetchFeedbackFromGoogleSheet(): Promise<Feedback[]> {
 /**
  * Fetch application state (store status, menu, gallery, reviews config) from Google Sheets
  */
-export async function fetchGlobalStateFromGoogleSheet(): Promise<Record<string, any> | null> {
+export async function fetchGlobalStateFromGoogleSheet(): Promise<Record<string, unknown> | null> {
   const webhookUrl = getGoogleSheetUrl();
   if (!webhookUrl || webhookUrl.includes('YOUR_DEPLOYMENT_ID')) {
     return null;
@@ -307,7 +310,7 @@ export async function fetchGlobalStateFromGoogleSheet(): Promise<Record<string, 
     });
     if (!res.ok) return null;
     const text = await res.text();
-    let parsed: { status?: string; data?: Record<string, any> } | null = null;
+    let parsed: { status?: string; data?: Record<string, unknown> } | null = null;
     try {
       parsed = JSON.parse(text);
     } catch {

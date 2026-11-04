@@ -1,5 +1,5 @@
 import { useState, useMemo } from 'react';
-import { Quote, MessageSquarePlus, CheckCircle2, Star } from 'lucide-react';
+import { Quote, MessageSquarePlus, CheckCircle2 } from 'lucide-react';
 import { useReviews } from '@/lib/hooks';
 import StarRating from '@/components/StarRating';
 import SectionHeading from '@/components/SectionHeading';
