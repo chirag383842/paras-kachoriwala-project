@@ -20,7 +20,7 @@ const AUTH_SALT = 'pk_secure_salt_8923a1_paras';
 // SHA-256 hash of "<password>:<salt>" for the author account. The plaintext
 // password is never stored here or anywhere else in the source.
 const AUTHOR_EMAIL = 'paras@gmail.com';
-const AUTHOR_PASSWORD_HASH = 'e382bd77220bc823e03d9ea822adfe68326894e727f4d43334926b4a1a1654bb';
+const AUTHOR_PASSWORD_HASH = 'c1691d918c6b3f4544be2994ea89f6806f07d62c829af9b0664acb78b613e303';
 const AUTHOR_NAME = 'Chirag Jain';
 const AUTHOR_ROLE = 'Owner & Author';
 
