@@ -524,7 +524,10 @@ export function useProducts() {
 
           // Merge deleted products from cloud
           if (cloudState && Array.isArray(cloudState.deleted_products)) {
-            cloudState.deleted_products.forEach((s: string) => markProductDeleted(s));
+            cloudState.deleted_products.forEach((s: string) => {
+              markProductDeleted(s);
+              deleted.add(s);
+            });
           }
 
           // Merge cloud products from Google Sheets if available
@@ -672,6 +675,7 @@ export function useProducts() {
           }
         } else if (d?.productId && d?.action === 'deleted') {
           const pid = d.productId;
+          markProductDeleted(pid);
           memoryProducts = current.filter((p) => p.id !== pid && p.slug !== pid);
           try {
             localStorage.setItem(STORAGE_PRODUCTS_KEY, JSON.stringify(memoryProducts));
@@ -737,6 +741,8 @@ export function useProducts() {
           } else if (payload.eventType === 'DELETE' && payload.old) {
             const oldId = (payload.old as { id?: string }).id;
             if (oldId) {
+              // Record a tombstone so a later Google Sheets / cache merge cannot resurrect it.
+              markProductDeleted(oldId);
               const current = memoryProducts ?? getLocalProducts() ?? DEFAULT_PRODUCTS;
               const updated = current.filter((p) => p.id !== oldId);
               memoryProducts = updated;
@@ -1023,7 +1029,10 @@ export function useGallery() {
 
           // Merge deleted gallery IDs from cloud
           if (cloudState && Array.isArray(cloudState.deleted_gallery)) {
-            cloudState.deleted_gallery.forEach((id: string) => markGalleryImageDeleted(id));
+            cloudState.deleted_gallery.forEach((id: string) => {
+              markGalleryImageDeleted(id);
+              deleted.add(id);
+            });
           }
 
           const currentLocal = (memoryGallery ?? getLocalGallery() ?? DEFAULT_GALLERY_IMAGES).filter(
@@ -1125,8 +1134,24 @@ export function useGallery() {
 
     const handleBroadcast = (e: MessageEvent) => {
       if (e.data?.type === 'GALLERY_CHANGED') {
-        const cached = memoryGallery ?? getLocalGallery();
-        if (cached) setState({ data: cached, loading: false, error: null });
+        const deletedId = e.data?.data?.deletedId as string | undefined;
+        if (deletedId) {
+          // Remember the deletion locally so cached copies cannot bring it back.
+          markGalleryImageDeleted(deletedId);
+          const current = memoryGallery ?? getLocalGallery() ?? DEFAULT_GALLERY_IMAGES;
+          const filtered = current.filter((img) => img.id !== deletedId);
+          memoryGallery = filtered;
+          try {
+            localStorage.setItem(STORAGE_GALLERY_KEY, JSON.stringify(filtered));
+          } catch {
+            /* ignore */
+          }
+          void idbSet(STORAGE_GALLERY_KEY, filtered);
+          setState({ data: filtered, loading: false, error: null });
+        } else {
+          const cached = memoryGallery ?? getLocalGallery();
+          if (cached) setState({ data: cached, loading: false, error: null });
+        }
         invalidateCache('sb:gallery');
         fetchGallery();
       }
@@ -1137,7 +1162,25 @@ export function useGallery() {
     try {
       channel = supabase
         .channel('realtime-gallery')
-        .on('postgres_changes', { event: '*', schema: 'public', table: 'gallery' }, () => {
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'gallery' }, (payload) => {
+          if (payload.eventType === 'DELETE') {
+            const oldId = (payload.old as { id?: string }).id;
+            if (oldId) {
+              // Record a tombstone so a later cache / Google Sheets merge cannot resurrect it.
+              markGalleryImageDeleted(oldId);
+              const current = memoryGallery ?? getLocalGallery() ?? DEFAULT_GALLERY_IMAGES;
+              const filtered = current.filter((img) => img.id !== oldId);
+              memoryGallery = filtered;
+              try {
+                localStorage.setItem(STORAGE_GALLERY_KEY, JSON.stringify(filtered));
+              } catch {
+                /* ignore */
+              }
+              void idbSet(STORAGE_GALLERY_KEY, filtered);
+              setState({ data: filtered, loading: false, error: null });
+              broadcastRealtimeEvent('GALLERY_CHANGED', { deletedId: oldId });
+            }
+          }
           invalidateCache('sb:gallery');
           fetchGallery();
         })

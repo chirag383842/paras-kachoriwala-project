@@ -12,8 +12,8 @@ const LOGO_SRC = '/images/logo.png';
 export default function Logo({ size = 'md', variant = 'full', className = '', onClick }: Props) {
   const iconDimensions = {
     sm: 'h-10 w-10 min-w-[2.5rem]',
-    md: 'h-11 w-11 sm:h-12 sm:w-12 min-w-[3rem]',
-    lg: 'h-14 w-14 sm:h-16 sm:w-16 min-w-[4rem]',
+    md: 'h-11 w-11 min-w-[2.75rem] sm:h-12 sm:w-12 sm:min-w-[3rem]',
+    lg: 'h-14 w-14 min-w-[3.5rem] sm:h-16 sm:w-16 sm:min-w-[4rem]',
   };
 
   const titleSizes = {
@@ -47,7 +47,7 @@ export default function Logo({ size = 'md', variant = 'full', className = '', on
       aria-label={`${BRAND.name} — Home`}
     >
       <div
-        className={`relative overflow-hidden rounded-2xl shadow-md transition-all duration-300 group-hover:scale-105 group-hover:shadow-lg ${
+        className={`relative shrink-0 overflow-hidden rounded-2xl aspect-square shadow-md transition-all duration-300 group-hover:scale-105 group-hover:shadow-lg ${
           isLight
             ? 'border border-amber-500/30 group-hover:border-amber-400 group-hover:shadow-[0_0_20px_rgba(245,158,11,0.25)]'
             : 'border border-spice-200 group-hover:border-spice-400 group-hover:shadow-[0_0_20px_rgba(217,119,6,0.2)]'
@@ -56,15 +56,15 @@ export default function Logo({ size = 'md', variant = 'full', className = '', on
         <img
           src={LOGO_SRC}
           alt=""
-          className="h-full w-full object-contain"
+          className="block h-full w-full max-w-full object-contain object-center"
           draggable={false}
         />
       </div>
 
       {variant !== 'icon-only' && (
-        <span className="flex flex-col leading-none">
+        <span className="flex min-w-0 flex-col leading-none">
           <span
-            className={`font-display font-bold transition-colors duration-200 ${
+            className={`truncate font-display font-bold transition-colors duration-200 ${
               isLight
                 ? 'text-white group-hover:text-amber-300'
                 : 'text-charcoal-900 group-hover:text-spice-700'
@@ -73,7 +73,7 @@ export default function Logo({ size = 'md', variant = 'full', className = '', on
             {BRAND.name}
           </span>
           <span
-            className={`uppercase mt-1 font-bold tracking-wider transition-colors duration-200 ${
+            className={`mt-1 truncate font-bold uppercase tracking-wider transition-colors duration-200 ${
               isLight ? 'text-amber-300/90 group-hover:text-amber-200' : 'text-spice-600 group-hover:text-spice-700'
             } ${taglineSizes[size]}`}
           >
