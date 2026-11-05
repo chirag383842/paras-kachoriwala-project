@@ -17,9 +17,10 @@ export type AuthSession = {
 
 // Security constants
 const AUTH_SALT = 'pk_secure_salt_8923a1_paras';
-// SHA-256 hash of "Chir@g2007:pk_secure_salt_8923a1_paras"
-const AUTHOR_EMAIL = 'jainchirag2111@gmail.com';
-const AUTHOR_PASSWORD_HASH = 'fbf5843db931a49ec4cc588d6502101ee73655a7a0f79a911e7dffae037d00c5';
+// SHA-256 hash of "<password>:<salt>" for the author account. The plaintext
+// password is never stored here or anywhere else in the source.
+const AUTHOR_EMAIL = 'paras@gmail.com';
+const AUTHOR_PASSWORD_HASH = 'e382bd77220bc823e03d9ea822adfe68326894e727f4d43334926b4a1a1654bb';
 const AUTHOR_NAME = 'Chirag Jain';
 const AUTHOR_ROLE = 'Owner & Author';
 

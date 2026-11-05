@@ -271,6 +271,10 @@ export function generateUUID(): string {
 let memoryProducts: Product[] | null = null;
 let memoryGallery: GalleryImage[] | null = null;
 
+// Guards against duplicate/parallel delete requests for the same gallery item
+// (e.g. a double-click) which could otherwise race each other.
+const galleryDeletionsInFlight = new Set<string>();
+
 export function getDeletedProductSlugs(): Set<string> {
   try {
     const raw = localStorage.getItem(STORAGE_DELETED_PRODUCTS_KEY);
@@ -1055,15 +1059,12 @@ export function useGallery() {
           if (!error && Array.isArray(data) && data.length > 0) {
             remoteLoadedRef.current = true;
             const remoteFormatted = (data as GalleryImage[]).map(normalizeGalleryItem);
-            const remoteMap = new Map(remoteFormatted.map((img) => [img.id, img]));
-
-            const merged = [...remoteFormatted];
-            for (const localImg of workingGallery) {
-              if (!remoteMap.has(localImg.id)) {
-                merged.push(localImg);
-              }
-            }
-            const filtered = merged.filter((img) => !deleted.has(img.id));
+            // Supabase is the single source of truth. When the authoritative remote
+            // read succeeds we must NOT fold the cached copy back in: doing so
+            // resurrects media the author already deleted (on another device or in
+            // another browser) purely from a stale local cache, even though the
+            // database row is gone.
+            const filtered = remoteFormatted.filter((img) => !deleted.has(img.id));
             memoryGallery = filtered;
             try {
               localStorage.setItem(STORAGE_GALLERY_KEY, JSON.stringify(filtered));
@@ -2378,91 +2379,121 @@ export async function updateGalleryImage(
 }
 
 export async function deleteGalleryImage(id: string): Promise<{ success: boolean; error?: string }> {
-  const current = memoryGallery ?? getLocalGallery() ?? DEFAULT_GALLERY_IMAGES;
-  const targetImg = current.find((img) => img.id === id);
-  const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
+  // Prevent duplicate/parallel delete requests for the same item.
+  if (galleryDeletionsInFlight.has(id)) {
+    return { success: false, error: 'This media is already being deleted. Please wait a moment.' };
+  }
+  galleryDeletionsInFlight.add(id);
 
-  // Supabase is authoritative: delete from the database first and verify.
-  let remoteSync = false;
-  let remoteError = '';
   try {
-    if (isUuid) {
-      const { error } = await withTimeout(
-        () => supabase.from('gallery').delete().eq('id', id).select('id'),
-        10000
-      );
-      if (error) {
-        remoteError = error.message;
-      } else {
-        const { data: still, error: vErr } = await withTimeout(
-          () => supabase.from('gallery').select('id').eq('id', id).maybeSingle(),
-          8000
-        );
-        if (vErr) remoteError = vErr.message;
-        else if (still) {
-          remoteError =
-            'The database did not delete this media (permission/RLS blocked). Run the Supabase fix script, then try again.';
-        } else remoteSync = true;
-      }
-    } else if (targetImg?.src) {
-      const { error } = await withTimeout(
-        () => supabase.from('gallery').delete().eq('src', targetImg.src).select('id'),
-        10000
-      );
-      if (error) {
-        remoteError = error.message;
-      } else {
-        const { data: still, error: vErr } = await withTimeout(
-          () => supabase.from('gallery').select('id').eq('src', targetImg.src).limit(1),
-          8000
-        );
-        if (vErr) remoteError = vErr.message;
-        else if (still && still.length > 0) {
-          remoteError =
-            'The database did not delete this media (permission/RLS blocked). Run the Supabase fix script, then try again.';
-        } else remoteSync = true;
-      }
-    } else {
-      // Nothing to delete remotely.
-      remoteSync = true;
+    const current = memoryGallery ?? getLocalGallery() ?? DEFAULT_GALLERY_IMAGES;
+    const targetImg = current.find((img) => img.id === id);
+    const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
+
+    // Nothing identifiable to delete remotely.
+    if (!isUuid && !targetImg?.src) {
+      return { success: true };
     }
-  } catch (err) {
-    remoteError = toErrMsg(err, 'Unable to reach the database.');
+
+    const removedIds = new Set<string>();
+    let remoteSync = false;
+    let remoteError = '';
+
+    try {
+      // 1. Read the authoritative list once. Reading the full (small) table avoids
+      //    putting a large base64 `src` into the request URL, which would 414.
+      const { data: rows, error: listErr } = await withTimeout(
+        () => supabase.from('gallery').select('id,src'),
+        10000
+      );
+      if (listErr) {
+        remoteError = listErr.message;
+      } else {
+        // 2. Collect every row that refers to this media — by id AND by source — so
+        //    that a stale local id or a duplicate/orphaned row is removed too,
+        //    instead of reporting success while the real row silently survives.
+        const targets = (rows || []).filter(
+          (row) => (isUuid && row.id === id) || (!!targetImg?.src && row.src === targetImg.src)
+        );
+
+        let deleteError = '';
+        for (const row of targets) {
+          const { error: dErr } = await withTimeout(
+            () => supabase.from('gallery').delete().eq('id', row.id).select('id'),
+            8000
+          );
+          if (dErr) deleteError = dErr.message;
+          else removedIds.add(row.id);
+        }
+
+        if (deleteError) {
+          remoteError = deleteError;
+        } else {
+          // 3. Verify: re-read and confirm nothing still references this media.
+          const { data: after, error: vErr } = await withTimeout(
+            () => supabase.from('gallery').select('id,src'),
+            8000
+          );
+          if (vErr) {
+            remoteError = vErr.message;
+          } else {
+            const stillThere = (after || []).some(
+              (row) => (isUuid && row.id === id) || (!!targetImg?.src && row.src === targetImg.src)
+            );
+            if (stillThere) {
+              remoteError =
+                'The database did not delete this media (permission/RLS blocked). Run the Supabase fix script, then try again.';
+            } else {
+              remoteSync = true;
+            }
+          }
+        }
+      }
+    } catch (err) {
+      remoteError = toErrMsg(err, 'Unable to reach the database.');
+    }
+
+    if (!remoteSync) {
+      return {
+        success: false,
+        error: remoteError || 'The media could not be deleted from the database. Please try again.',
+      };
+    }
+
+    // The database confirmed the delete — now update local state and notify tabs.
+    // Tombstone every id that was actually removed so no cached copy can resurrect it.
+    markGalleryImageDeleted(id);
+    for (const removedId of removedIds) markGalleryImageDeleted(removedId);
+    const deleted = getDeletedGalleryIds();
+    const currentFiltered = current.filter(
+      (img) =>
+        img.id !== id && !deleted.has(img.id) && (!targetImg?.src || img.src !== targetImg.src)
+    );
+    memoryGallery = currentFiltered;
+
+    try {
+      localStorage.setItem(STORAGE_GALLERY_KEY, JSON.stringify(currentFiltered));
+    } catch {
+      /* ignore */
+    }
+    await idbSet(STORAGE_GALLERY_KEY, currentFiltered);
+
+    invalidateCache('sb:gallery');
+    broadcastRealtimeEvent('GALLERY_CHANGED', { deletedId: id });
+    window.dispatchEvent(new Event('pk_gallery_changed'));
+
+    // Google Sheets is a best-effort mirror only.
+    try {
+      void saveGlobalStateToGoogleSheet('gallery', currentFiltered);
+      void saveGlobalStateToGoogleSheet('deleted_gallery', Array.from(deleted));
+    } catch (sheetErr) {
+      console.warn('Google Sheets gallery delete sync notice:', sheetErr);
+    }
+
+    return { success: true };
+  } finally {
+    galleryDeletionsInFlight.delete(id);
   }
-
-  if (!remoteSync) {
-    return {
-      success: false,
-      error: remoteError || 'The media could not be deleted from the database. Please try again.',
-    };
-  }
-
-  // The database confirmed the delete — now update local state and notify tabs.
-  markGalleryImageDeleted(id);
-  const deleted = getDeletedGalleryIds();
-  const currentFiltered = current.filter((img) => img.id !== id && !deleted.has(img.id));
-  memoryGallery = currentFiltered;
-
-  try {
-    localStorage.setItem(STORAGE_GALLERY_KEY, JSON.stringify(currentFiltered));
-  } catch {
-    /* ignore */
-  }
-  await idbSet(STORAGE_GALLERY_KEY, currentFiltered);
-
-  invalidateCache('sb:gallery');
-  broadcastRealtimeEvent('GALLERY_CHANGED', { deletedId: id });
-  window.dispatchEvent(new Event('pk_gallery_changed'));
-
-  // Google Sheets is a best-effort mirror only.
-  try {
-    void saveGlobalStateToGoogleSheet('gallery', currentFiltered);
-    void saveGlobalStateToGoogleSheet('deleted_gallery', Array.from(deleted));
-  } catch (sheetErr) {
-    console.warn('Google Sheets gallery delete sync notice:', sheetErr);
-  }
-
-  return { success: true };
 }
 
 export async function clearAllGalleryImages(): Promise<{ success: boolean; error?: string }> {
