@@ -2,8 +2,6 @@
 import type { Feedback } from './types';
 
 const GOOGLE_SHEET_URL_KEY = 'pk_google_sheet_webhook_url_v2';
-export const DEFAULT_GOOGLE_SHEET_URL =
-  'https://script.google.com/macros/s/AKfycbwLc-t7sDn6b_cJ_ig5j6OLsK9nqtWfZZH-oWOU9O4l1wc3pRau1fu3KFF4-WPcB3ff0Q/exec';
 
 export function getGoogleSheetUrl(): string {
   // 1. Highest priority: User customized webhook URL in Admin portal
@@ -22,7 +20,9 @@ export function getGoogleSheetUrl(): string {
     return envUrl;
   }
 
-  return DEFAULT_GOOGLE_SHEET_URL;
+  // No hardcoded fallback: the webhook must be supplied via environment
+  // variable or configured in the Admin portal.
+  return '';
 }
 
 export function setGoogleSheetUrl(url: string): void {

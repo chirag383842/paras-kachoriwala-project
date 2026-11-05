@@ -6,8 +6,10 @@ export const BRAND = {
   description:
     'Serving delicious Kachori (Regular, Jain & Swaminarayan) and Bhel loved by our customers for years. A trusted local food destination, famous for taste and freshness.',
   address: 'Paras Kachoriwala, Below SK Mobile, Near Sangam Char Rasta, Vadodara, Gujarat, India.',
-  mapsLink: 'https://maps.app.goo.gl/CToVpdk32QaesD3J7',
-  mapsEmbed: 'https://maps.app.goo.gl/CToVpdk32QaesD3J7',
+  mapsLink:
+    'https://www.google.com/maps/place/Paras+Kachoriwala/@22.3190231,73.2123269,767m/data=!3m2!1e3!4b1!4m6!3m5!1s0x395fcf6ea8cd0e57:0x9044eec97be95ff3!8m2!3d22.3190231!4d73.2123269!16s%2Fg%2F11f3n1ykv_?entry=ttu&g_ep=EgoyMDI2MTEwMi4wIKXMDSoASAFQAw%3D%3D',
+  mapsEmbed:
+    'https://www.google.com/maps/place/Paras+Kachoriwala/@22.3190231,73.2123269,767m/data=!3m2!1e3!4b1!4m6!3m5!1s0x395fcf6ea8cd0e57:0x9044eec97be95ff3!8m2!3d22.3190231!4d73.2123269!16s%2Fg%2F11f3n1ykv_?entry=ttu&g_ep=EgoyMDI2MTEwMi4wIKXMDSoASAFQAw%3D%3D',
   phone: '',
   timezone: 'Asia/Kolkata',
   paymentNote: 'Cash Payment Only • Token System at Counter',

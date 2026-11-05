@@ -496,7 +496,7 @@ export default function Admin({ onNavigate }: Props) {
     );
 
     if (res.success) {
-      await refetchProducts();
+      void refetchProducts();
       // 3. Only report success once the database confirmed the change.
       const liveMsg = newAvailable
         ? `Live Website: ${product.name} is now marked IN STOCK!`
@@ -541,7 +541,7 @@ export default function Admin({ onNavigate }: Props) {
     );
 
     if (res.success) {
-      await refetchProducts();
+      void refetchProducts();
       setProductMessages((prev) => ({
         ...prev,
         [product.slug]: `✓ Price & details for ${product.name} updated live across all devices!`,
@@ -604,7 +604,7 @@ export default function Admin({ onNavigate }: Props) {
     );
 
     if (res.success) {
-      await refetchProducts();
+      void refetchProducts();
       const successMsg = `✓ Live: ${product.name} price saved to ₹${priceToSave} & updated across all devices!`;
       setProductMessages((prev) => ({
         ...prev,
@@ -656,7 +656,7 @@ export default function Admin({ onNavigate }: Props) {
       );
 
       if (res.success) {
-        await refetchProducts();
+        void refetchProducts();
         setProductMessages((prev) => ({
           ...prev,
           [target.slug]: `Photo for ${target.name} updated live across entire website!`,
@@ -708,7 +708,7 @@ export default function Admin({ onNavigate }: Props) {
     );
 
     if (res.success) {
-      await refetchProducts();
+      void refetchProducts();
       setProductMessages((prev) => ({
         ...prev,
         [product.slug]: `Photo removed for ${product.name}. Default icon will be shown.`,
