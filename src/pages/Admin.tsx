@@ -35,7 +35,7 @@ import {
   ExternalLink,
   AlertTriangle,
 } from 'lucide-react';
-import { login, logout, getAuthUser, checkLockout, type AuthUser } from '@/lib/auth';
+import { login, logout, getAuthUser, checkLockout, verifyOtpAndActivate, resendOtp, cancelOtp, type AuthUser } from '@/lib/auth';
 import {
   useProducts,
   useStoreStatus,
@@ -83,6 +83,15 @@ export default function Admin({ onNavigate }: Props) {
   const [loginError, setLoginError] = useState('');
   const [isLoggingIn, setIsLoggingIn] = useState(false);
   const [lockoutSeconds, setLockoutSeconds] = useState(0);
+
+  // Two-step sign-in: credentials first, then the code emailed to the fixed
+  // author address. Step 2 is the only place a session is created.
+  const [loginStage, setLoginStage] = useState<'credentials' | 'otp'>('credentials');
+  const [otpCode, setOtpCode] = useState('');
+  const [otpChallengeId, setOtpChallengeId] = useState('');
+  const [otpError, setOtpError] = useState('');
+  const [isVerifyingOtp, setIsVerifyingOtp] = useState(false);
+  const [resendSeconds, setResendSeconds] = useState(0);
 
   // Tab State
   const [activeTab, setActiveTab] = useState<'status' | 'products' | 'gallery' | 'feedback'>('status');
@@ -257,6 +266,21 @@ export default function Admin({ onNavigate }: Props) {
     return () => window.removeEventListener('pk_auth_state_changed', checkAuth);
   }, []);
 
+  // Countdown for the OTP resend cooldown.
+  useEffect(() => {
+    if (resendSeconds <= 0) return;
+    const interval = setInterval(() => {
+      setResendSeconds((prev) => {
+        if (prev <= 1) {
+          clearInterval(interval);
+          return 0;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [resendSeconds]);
+
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     if (lockoutSeconds > 0) return;
@@ -265,7 +289,15 @@ export default function Admin({ onNavigate }: Props) {
     setLoginError('');
 
     const res = await login(email, password);
-    if (res.success && res.user) {
+    if (res.success && res.requiresOtp) {
+      // Credentials accepted — the backend has emailed the verification code.
+      setOtpChallengeId(res.challengeId ?? '');
+      setOtpCode('');
+      setOtpError('');
+      setResendSeconds(60);
+      setPassword('');
+      setLoginStage('otp');
+    } else if (res.success && res.user) {
       setUser(res.user);
       setLoginError('');
     } else {
@@ -277,9 +309,58 @@ export default function Admin({ onNavigate }: Props) {
     setIsLoggingIn(false);
   };
 
+  const handleVerifyOtp = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (isVerifyingOtp || otpCode.length !== 6) return;
+
+    setIsVerifyingOtp(true);
+    setOtpError('');
+
+    const res = await verifyOtpAndActivate(otpChallengeId, otpCode);
+    if (res.success && res.user) {
+      setUser(res.user);
+      setLoginStage('credentials');
+      setOtpCode('');
+      setLoginError('');
+    } else {
+      setOtpError(res.error ?? 'Incorrect verification code.');
+      if (res.error?.includes('sign in again')) {
+        setLoginStage('credentials');
+      }
+    }
+    setIsVerifyingOtp(false);
+  };
+
+  const handleResendOtp = async () => {
+    if (resendSeconds > 0 || isVerifyingOtp) return;
+    setOtpError('');
+    const res = await resendOtp();
+    if (res.ok && res.challengeId) {
+      setOtpChallengeId(res.challengeId);
+      setOtpCode('');
+      setResendSeconds(60);
+    } else {
+      setOtpError(res.error ?? 'Could not resend the verification code.');
+      if (res.error?.includes('sign in again')) {
+        setLoginStage('credentials');
+      }
+    }
+  };
+
+  const handleBackToCredentials = () => {
+    cancelOtp();
+    setLoginStage('credentials');
+    setOtpCode('');
+    setOtpError('');
+    setPassword('');
+  };
+
   const handleLogout = () => {
     logout();
     setUser(null);
+    setLoginStage('credentials');
+    setOtpCode('');
+    setOtpError('');
   };
 
   // 1. Store Status Actions
@@ -1157,11 +1238,22 @@ export default function Admin({ onNavigate }: Props) {
             </p>
           </div>
 
-          <form onSubmit={handleLogin} className="mt-8 space-y-5" noValidate>
+          <form
+            onSubmit={loginStage === 'otp' ? handleVerifyOtp : handleLogin}
+            className="mt-8 space-y-5"
+            noValidate
+          >
             {loginError && (
               <div className="rounded-xl bg-red-50 border border-red-200 p-4 text-xs font-medium text-red-700 flex items-start gap-2 animate-shake">
                 <AlertCircle size={16} className="shrink-0 mt-0.5" />
                 <span>{loginError}</span>
+              </div>
+            )}
+
+            {otpError && (
+              <div className="rounded-xl bg-red-50 border border-red-200 p-4 text-xs font-medium text-red-700 flex items-start gap-2 animate-shake">
+                <AlertCircle size={16} className="shrink-0 mt-0.5" />
+                <span>{otpError}</span>
               </div>
             )}
 
@@ -1172,65 +1264,132 @@ export default function Admin({ onNavigate }: Props) {
               </div>
             )}
 
-            <div>
-              <label className="block text-xs font-bold uppercase tracking-wider text-charcoal-700 mb-1.5">
-                Author Email Address
-              </label>
-              <input
-                type="email"
-                required
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
-                placeholder="Enter your email"
-                className="w-full rounded-xl border border-spice-200 bg-spice-50/50 px-4 py-3 text-sm text-charcoal-900 placeholder:text-charcoal-400 focus:border-spice-500 focus:bg-white transition-colors"
-                autoComplete="email"
-                disabled={lockoutSeconds > 0}
-              />
-            </div>
+            {loginStage === 'credentials' ? (
+              <>
+                <div>
+                  <label className="block text-xs font-bold uppercase tracking-wider text-charcoal-700 mb-1.5">
+                    Author Email Address
+                  </label>
+                  <input
+                    type="email"
+                    required
+                    value={email}
+                    onChange={(e) => setEmail(e.target.value)}
+                    placeholder="Enter your email"
+                    className="w-full rounded-xl border border-spice-200 bg-spice-50/50 px-4 py-3 text-sm text-charcoal-900 placeholder:text-charcoal-400 focus:border-spice-500 focus:bg-white transition-colors"
+                    autoComplete="email"
+                    disabled={lockoutSeconds > 0}
+                  />
+                </div>
 
-            <div>
-              <label className="block text-xs font-bold uppercase tracking-wider text-charcoal-700 mb-1.5">
-                Password
-              </label>
-              <div className="relative">
+                <div>
+                  <label className="block text-xs font-bold uppercase tracking-wider text-charcoal-700 mb-1.5">
+                    Password
+                  </label>
+                  <div className="relative">
+                    <input
+                      type={showPassword ? 'text' : 'password'}
+                      required
+                      value={password}
+                      onChange={(e) => setPassword(e.target.value)}
+                      placeholder="Enter your password"
+                      className="w-full rounded-xl border border-spice-200 bg-spice-50/50 px-4 py-3 pr-11 text-sm text-charcoal-900 placeholder:text-charcoal-400 focus:border-spice-500 focus:bg-white transition-colors"
+                      autoComplete="current-password"
+                      disabled={lockoutSeconds > 0}
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setShowPassword(!showPassword)}
+                      className="absolute right-3 top-1/2 -translate-y-1/2 text-charcoal-400 hover:text-charcoal-700 p-1"
+                      aria-label={showPassword ? 'Hide password' : 'Show password'}
+                    >
+                      {showPassword ? <EyeOff size={18} /> : <Eye size={18} />}
+                    </button>
+                  </div>
+                </div>
+              </>
+            ) : (
+              <div>
+                <div className="rounded-xl bg-spice-50 border border-spice-200 p-4 text-xs font-medium text-spice-800 flex items-start gap-2">
+                  <ShieldCheck size={16} className="shrink-0 mt-0.5" />
+                  <span>
+                    A 6-digit verification code has been sent to the registered author email address. Enter it below to finish signing in. The code expires in 5 minutes.
+                  </span>
+                </div>
+                <label className="mt-4 block text-xs font-bold uppercase tracking-wider text-charcoal-700 mb-1.5">
+                  Verification Code
+                </label>
                 <input
-                  type={showPassword ? 'text' : 'password'}
-                  required
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                  placeholder="Enter your password"
-                  className="w-full rounded-xl border border-spice-200 bg-spice-50/50 px-4 py-3 pr-11 text-sm text-charcoal-900 placeholder:text-charcoal-400 focus:border-spice-500 focus:bg-white transition-colors"
-                  autoComplete="current-password"
-                  disabled={lockoutSeconds > 0}
+                  type="text"
+                  inputMode="numeric"
+                  autoComplete="one-time-code"
+                  maxLength={6}
+                  value={otpCode}
+                  onChange={(e) => setOtpCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                  placeholder="Enter 6-digit code"
+                  className="w-full rounded-xl border border-spice-200 bg-spice-50/50 px-4 py-3 text-center text-lg tracking-[0.4em] font-bold text-charcoal-900 placeholder:text-charcoal-400 placeholder:text-sm placeholder:tracking-normal placeholder:font-normal focus:border-spice-500 focus:bg-white transition-colors"
+                  autoFocus
                 />
+              </div>
+            )}
+
+            {loginStage === 'credentials' ? (
+              <button
+                type="submit"
+                disabled={isLoggingIn || lockoutSeconds > 0}
+                className="btn-primary w-full py-3 mt-2 flex items-center justify-center gap-2 shadow-warm disabled:opacity-50"
+              >
+                {isLoggingIn ? (
+                  <>
+                    <RefreshCw size={18} className="animate-spin" />
+                    Verifying Security...
+                  </>
+                ) : (
+                  <>
+                    <Lock size={18} />
+                    Login to Author Dashboard
+                  </>
+                )}
+              </button>
+            ) : (
+              <button
+                type="submit"
+                disabled={isVerifyingOtp || otpCode.length !== 6}
+                className="btn-primary w-full py-3 mt-2 flex items-center justify-center gap-2 shadow-warm disabled:opacity-50"
+              >
+                {isVerifyingOtp ? (
+                  <>
+                    <RefreshCw size={18} className="animate-spin" />
+                    Verifying Code...
+                  </>
+                ) : (
+                  <>
+                    <ShieldCheck size={18} />
+                    Verify &amp; Open Dashboard
+                  </>
+                )}
+              </button>
+            )}
+
+            {loginStage === 'otp' && (
+              <div className="flex items-center gap-3">
                 <button
                   type="button"
-                  onClick={() => setShowPassword(!showPassword)}
-                  className="absolute right-3 top-1/2 -translate-y-1/2 text-charcoal-400 hover:text-charcoal-700 p-1"
-                  aria-label={showPassword ? 'Hide password' : 'Show password'}
+                  onClick={handleBackToCredentials}
+                  className="btn-outline flex-1 py-2.5 text-xs text-charcoal-600 border-charcoal-200 hover:bg-charcoal-50"
                 >
-                  {showPassword ? <EyeOff size={18} /> : <Eye size={18} />}
+                  ← Back
+                </button>
+                <button
+                  type="button"
+                  onClick={handleResendOtp}
+                  disabled={resendSeconds > 0 || isVerifyingOtp}
+                  className="btn-outline flex-1 py-2.5 text-xs text-charcoal-600 border-charcoal-200 hover:bg-charcoal-50 disabled:opacity-50"
+                >
+                  {resendSeconds > 0 ? `Resend in ${resendSeconds}s` : 'Resend Code'}
                 </button>
               </div>
-            </div>
-
-            <button
-              type="submit"
-              disabled={isLoggingIn || lockoutSeconds > 0}
-              className="btn-primary w-full py-3 mt-2 flex items-center justify-center gap-2 shadow-warm disabled:opacity-50"
-            >
-              {isLoggingIn ? (
-                <>
-                  <RefreshCw size={18} className="animate-spin" />
-                  Verifying Security...
-                </>
-              ) : (
-                <>
-                  <Lock size={18} />
-                  Login to Author Dashboard
-                </>
-              )}
-            </button>
+            )}
 
             <button
               type="button"

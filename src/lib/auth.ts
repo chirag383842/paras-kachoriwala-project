@@ -31,6 +31,10 @@ const SESSION_EXPIRY_MS = 2 * 60 * 60 * 1000; // 2 hours inactivity timeout
 const MAX_FAILED_ATTEMPTS = 5;
 const LOCKOUT_DURATION_MS = 5 * 60 * 1000; // 5 minutes lockout
 
+// Trusted backend endpoints that generate and verify the emailed second factor.
+const OTP_SEND_ENDPOINT = '/api/otp/send';
+const OTP_VERIFY_ENDPOINT = '/api/otp/verify';
+
 // In-memory mirror of the author session. localStorage writes can legitimately
 // fail (private browsing, or a quota already consumed by the base64 gallery
 // cache). When that happens a validly authenticated admin must keep working for
@@ -40,6 +44,11 @@ let memorySession: AuthSession | null = null;
 // Guards against duplicate Supabase Auth requests when the login form is
 // submitted repeatedly (double clicks, retries after a slow response).
 let supabaseAuthBridgeInFlight = false;
+
+// Holds the validated credentials while the admin completes the emailed OTP
+// step. Kept in memory only — never persisted — so the second factor cannot be
+// skipped by reloading the page or by editing localStorage.
+let pendingAuth: { user: AuthUser; password: string } | null = null;
 
 /**
  * Computes SHA-256 hash with salt using Web Crypto API
@@ -131,10 +140,124 @@ function bridgeSupabaseAuth(password: string): void {
   })();
 }
 
+/** Creates and persists the author session. Only ever called after OTP success. */
+function createSession(user: AuthUser): AuthSession {
+  // Generate random cryptographic session token (Session Fixation protection)
+  const token = crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}_${Math.random().toString(36).slice(2)}`;
+  const now = Date.now();
+  const session: AuthSession = { user, token, createdAt: now, lastActive: now };
+
+  try {
+    localStorage.setItem(STORAGE_SESSION_KEY, JSON.stringify(session));
+  } catch {
+    // Storage unavailable (private mode / quota exhausted) — the in-memory
+    // session below keeps this page authorised.
+  }
+  memorySession = session;
+  window.dispatchEvent(new Event('pk_auth_state_changed'));
+  return session;
+}
+
+type OtpSendOutcome = { ok: boolean; challengeId?: string; expiresInSeconds?: number; error?: string };
+
+/** Asks the trusted backend to email a fresh code to the fixed author address. */
+async function requestOtpCode(): Promise<OtpSendOutcome> {
+  try {
+    const response = await fetch(OTP_SEND_ENDPOINT, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    const data = (await response.json().catch(() => ({}))) as {
+      ok?: boolean;
+      challengeId?: string;
+      expiresInSeconds?: number;
+      error?: string;
+    };
+    if (!response.ok || !data.ok || !data.challengeId) {
+      return { ok: false, error: data.error || 'Could not send the verification code. Please try again.' };
+    }
+    return { ok: true, challengeId: data.challengeId, expiresInSeconds: data.expiresInSeconds };
+  } catch {
+    return { ok: false, error: 'Verification service is unreachable. Please check your connection and try again.' };
+  }
+}
+
+/** Requests a new code, which invalidates the previous one. */
+export async function resendOtp(): Promise<OtpSendOutcome> {
+  if (!pendingAuth) {
+    return { ok: false, error: 'Your sign-in session expired. Please enter your email and password again.' };
+  }
+  return requestOtpCode();
+}
+
+/** Abandons a pending OTP step (e.g. the admin goes Back). */
+export function cancelOtp(): void {
+  pendingAuth = null;
+}
+
+/**
+ * Verifies the emailed code on the trusted backend. The author session is only
+ * created once the backend confirms the code is correct, unexpired and unused.
+ */
+export async function verifyOtpAndActivate(
+  challengeId: string,
+  code: string
+): Promise<{ success: boolean; user?: AuthUser; error?: string; remainingAttempts?: number }> {
+  // Capture locally so the narrowing survives the awaits below.
+  const pending = pendingAuth;
+  if (!pending) {
+    return { success: false, error: 'Your sign-in session expired. Please enter your email and password again.' };
+  }
+
+  try {
+    const response = await fetch(OTP_VERIFY_ENDPOINT, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ challengeId, code }),
+    });
+    const data = (await response.json().catch(() => ({}))) as {
+      ok?: boolean;
+      error?: string;
+      remainingAttempts?: number;
+    };
+    if (!response.ok || !data.ok) {
+      return {
+        success: false,
+        error: data.error || 'Incorrect verification code.',
+        remainingAttempts: data.remainingAttempts,
+      };
+    }
+
+    const { user, password } = pending;
+    pendingAuth = null;
+    createSession(user);
+
+    // Bridge authentication with Supabase Auth in the background. It never
+    // delays or fails the login now that the password has been verified.
+    bridgeSupabaseAuth(password);
+
+    return { success: true, user };
+  } catch {
+    return { success: false, error: 'Verification service is unreachable. Please try again.' };
+  }
+}
+
+export type LoginResult = {
+  success: boolean;
+  user?: AuthUser;
+  /** True when the credentials passed and an OTP has been emailed. No session yet. */
+  requiresOtp?: boolean;
+  challengeId?: string;
+  expiresInSeconds?: number;
+  error?: string;
+  remainingSeconds?: number;
+};
+
 export async function login(
   email: string,
   password: string
-): Promise<{ success: boolean; user?: AuthUser; error?: string; remainingSeconds?: number }> {
+): Promise<LoginResult> {
   // 1. Check rate limiting
   const lockout = checkLockout();
   if (lockout.isLocked) {
@@ -160,7 +283,8 @@ export async function login(
   const hashMatches = hash === AUTHOR_PASSWORD_HASH;
 
   if (emailMatches && hashMatches) {
-    // Reset rate limiter on successful login
+    // Credentials are valid. Do NOT grant a session yet: a code must be
+    // delivered to the fixed author mailbox and verified first.
     saveRateLimitData({ failedAttempts: 0, lockedUntil: null });
 
     const user: AuthUser = {
@@ -169,31 +293,20 @@ export async function login(
       role: AUTHOR_ROLE,
     };
 
-    // Generate random cryptographic session token (Session Fixation protection)
-    const token = crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}_${Math.random().toString(36).slice(2)}`;
-    const now = Date.now();
+    pendingAuth = { user, password: cleanPass };
 
-    const session: AuthSession = {
-      user,
-      token,
-      createdAt: now,
-      lastActive: now,
-    };
-
-    try {
-      localStorage.setItem(STORAGE_SESSION_KEY, JSON.stringify(session));
-    } catch {
-      // Storage unavailable (private mode / quota exhausted) — the in-memory
-      // session below keeps this page authorised.
+    const sent = await requestOtpCode();
+    if (!sent.ok) {
+      pendingAuth = null;
+      return { success: false, error: sent.error };
     }
-    memorySession = session;
-    window.dispatchEvent(new Event('pk_auth_state_changed'));
 
-    // Bridge authentication with Supabase Auth in the background. It never
-    // delays or fails the local login.
-    bridgeSupabaseAuth(cleanPass);
-
-    return { success: true, user };
+    return {
+      success: true,
+      requiresOtp: true,
+      challengeId: sent.challengeId,
+      expiresInSeconds: sent.expiresInSeconds,
+    };
   }
 
   // Handle failed attempt & rate limiting
@@ -222,6 +335,7 @@ export async function login(
 export function logout(): void {
   try {
     memorySession = null;
+    pendingAuth = null;
     localStorage.removeItem(STORAGE_SESSION_KEY);
     void supabase.auth.signOut().catch(() => {});
     window.dispatchEvent(new Event('pk_auth_state_changed'));
