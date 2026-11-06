@@ -166,6 +166,11 @@ const STORAGE_FEEDBACK_KEY = 'pk_all_feedback_records_v3';
 const STORAGE_DELETED_REVIEWS_KEY = 'pk_deleted_review_ids_v4';
 const STORAGE_FEATURED_REVIEWS_KEY = 'pk_featured_review_ids_v4';
 const STORAGE_UNFEATURED_REVIEWS_KEY = 'pk_unfeatured_review_ids_v4';
+// IDs of reviews that have been confirmed present in the Supabase `feedback`
+// table by at least one successful read. Used to detect reviews that were
+// deleted remotely (present before, missing now) so the cached copy on this
+// device can never resurrect them.
+const STORAGE_REMOTE_REVIEWS_KEY = 'pk_remote_review_ids_v1';
 
 // Actively purge all legacy cache keys from earlier app builds across all customer & admin devices
 const LEGACY_STORAGE_KEYS = [
@@ -457,6 +462,92 @@ export function markReviewDeleted(id: string): void {
     localStorage.setItem(STORAGE_UNFEATURED_REVIEWS_KEY, JSON.stringify(Array.from(unfeatured)));
   } catch {
     /* ignore */
+  }
+}
+
+function getKnownRemoteReviewIds(): Set<string> {
+  try {
+    const raw = localStorage.getItem(STORAGE_REMOTE_REVIEWS_KEY);
+    return raw ? new Set<string>(JSON.parse(raw)) : new Set<string>();
+  } catch {
+    return new Set<string>();
+  }
+}
+
+const REVIEW_ID_UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// A locally cached review is only treated as remotely deleted once it is old
+// enough that its own database insert must already have completed. This keeps
+// an in-flight submission from being mistaken for a deletion.
+const REMOTE_DELETE_GRACE_MS = 2 * 60 * 1000;
+
+/**
+ * Supabase is the single source of truth for customer reviews.
+ *
+ * A review that is still cached locally but is missing from a *successful*
+ * remote read was deleted — either from this device or from another admin on
+ * another device. Such IDs are tombstoned locally so the cached copy, the
+ * Google Sheets mirror, or a stale local list can never resurrect them.
+ *
+ * Local rows that were never persisted remotely (non-UUID ids, or rows too
+ * new to have completed their insert) are left untouched.
+ *
+ * Must only be called after a successful remote read (i.e. `data` is an
+ * array), otherwise a network failure would look like "everything deleted".
+ *
+ * @param remoteIds IDs returned by the latest successful Supabase read.
+ * @returns number of remotely-deleted reviews that were tombstoned.
+ */
+export function reconcileRemoteReviewIds(remoteIds: Iterable<string>): number {
+  try {
+    const remote = new Set<string>(remoteIds);
+    const now = Date.now();
+
+    const known = getKnownRemoteReviewIds();
+    const deletedRemotely = new Set<string>();
+
+    // 1. Reviews previously confirmed present in Supabase and now missing.
+    known.forEach((id) => {
+      if (!remote.has(id)) deletedRemotely.add(id);
+    });
+
+    // 2. Reviews still held in the local cache (or the Sheets mirror) with a
+    //    real database id but absent from the authoritative remote list.
+    getLocalFeedbackList().forEach((row) => {
+      if (!row || !row.id || remote.has(row.id)) return;
+      if (!REVIEW_ID_UUID_PATTERN.test(row.id)) return;
+      const createdAt = row.created_at ? new Date(row.created_at).getTime() : Number.NaN;
+      if (!Number.isFinite(createdAt) || now - createdAt < REMOTE_DELETE_GRACE_MS) return;
+      deletedRemotely.add(row.id);
+    });
+
+    if (deletedRemotely.size === 0) {
+      // Refresh the ledger so reviews that just synced are remembered.
+      const next = new Set(known);
+      remote.forEach((id) => next.add(id));
+      try {
+        localStorage.setItem(STORAGE_REMOTE_REVIEWS_KEY, JSON.stringify(Array.from(next)));
+      } catch {
+        /* ignore */
+      }
+      return 0;
+    }
+
+    deletedRemotely.forEach((id) => markReviewDeleted(id));
+
+    const next = new Set(known);
+    remote.forEach((id) => next.add(id));
+    deletedRemotely.forEach((id) => next.delete(id));
+    try {
+      localStorage.setItem(STORAGE_REMOTE_REVIEWS_KEY, JSON.stringify(Array.from(next)));
+    } catch {
+      /* ignore */
+    }
+
+    return deletedRemotely.size;
+  } catch {
+    return 0;
   }
 }
 
@@ -1259,6 +1350,14 @@ export function useReviews() {
         }
       }
 
+      // Supabase is the single source of truth for customer reviews. A review
+      // that was confirmed present remotely and is now missing was deleted —
+      // from this device or from another admin/device. Tombstone those IDs so
+      // the local cache and the Google Sheets mirror can never bring them back.
+      if (Array.isArray(sbRes.data)) {
+        reconcileRemoteReviewIds(sbRes.data.map((row) => row.id));
+      }
+
       const deletedIds = getDeletedReviewIds();
       const featuredIds = getFeaturedReviewIds();
       const unfeaturedIds = getUnfeaturedReviewIds();
@@ -1358,7 +1457,14 @@ export function useReviews() {
     try {
       channel = supabase
         .channel('realtime-reviews-customer')
-        .on('postgres_changes', { event: '*', schema: 'public', table: 'feedback' }, () => {
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'feedback' }, (payload) => {
+          // A DELETE payload carries only the primary key. Tombstone it
+          // immediately so the removal is applied even if this device never
+          // performed the deletion itself.
+          if (payload?.eventType === 'DELETE') {
+            const removedId = (payload.old as { id?: string } | undefined)?.id;
+            if (removedId) markReviewDeleted(removedId);
+          }
           invalidateCache('sb:reviews');
           fetchReviews();
         })
@@ -1431,6 +1537,14 @@ export function useFeedbackList() {
           rs.deleted.forEach((id: string) => dSet.add(id));
           localStorage.setItem(STORAGE_DELETED_REVIEWS_KEY, JSON.stringify(Array.from(dSet)));
         }
+      }
+
+      // Supabase is the single source of truth for customer reviews. A review
+      // that was confirmed present remotely and is now missing was deleted —
+      // from this device or from another admin/device. Tombstone those IDs so
+      // the local cache and the Google Sheets mirror can never bring them back.
+      if (Array.isArray(sbRes.data)) {
+        reconcileRemoteReviewIds(sbRes.data.map((row) => row.id));
       }
 
       const deletedIds = getDeletedReviewIds();
@@ -1538,7 +1652,14 @@ export function useFeedbackList() {
     try {
       channel = supabase
         .channel('realtime-feedback-admin-panel')
-        .on('postgres_changes', { event: '*', schema: 'public', table: 'feedback' }, () => {
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'feedback' }, (payload) => {
+          // A DELETE payload carries only the primary key. Tombstone it
+          // immediately so the removal is applied even if this device never
+          // performed the deletion itself.
+          if (payload?.eventType === 'DELETE') {
+            const removedId = (payload.old as { id?: string } | undefined)?.id;
+            if (removedId) markReviewDeleted(removedId);
+          }
           fetchFeedback();
         })
         .subscribe();
