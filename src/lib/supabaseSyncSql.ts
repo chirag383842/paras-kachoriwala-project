@@ -179,4 +179,26 @@ ON CONFLICT (slug) DO UPDATE SET
 INSERT INTO gallery (src, alt, category, caption, display_order)
 SELECT '/images/kachori.webp', 'Crispy signature Kachori served hot at Paras Kachoriwala', 'food', 'Signature Kachori', 1
 WHERE NOT EXISTS (SELECT 1 FROM gallery);
+
+-- 9. OTP table for admin two-factor login
+CREATE TABLE IF NOT EXISTS admin_login_otp (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  challenge_id uuid UNIQUE NOT NULL,
+  code_hash text NOT NULL,
+  expires_at timestamptz NOT NULL,
+  attempts integer NOT NULL DEFAULT 0,
+  max_attempts integer NOT NULL DEFAULT 5,
+  used boolean NOT NULL DEFAULT false,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+-- Index for fast lookups by challenge_id and time-based cleanup
+CREATE INDEX IF NOT EXISTS admin_login_otp_challenge_id_idx ON admin_login_otp (challenge_id);
+CREATE INDEX IF NOT EXISTS admin_login_otp_created_at_idx ON admin_login_otp (created_at);
+
+-- Only the service role can access this table (no public/anon access)
+ALTER TABLE admin_login_otp ENABLE ROW LEVEL SECURITY;
+-- Service role bypasses RLS automatically; deny everything else:
+CREATE POLICY IF NOT EXISTS "No public access to OTP table"
+  ON admin_login_otp FOR ALL USING (false);
 `;

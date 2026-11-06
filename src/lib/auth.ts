@@ -168,6 +168,12 @@ async function requestOtpCode(): Promise<OtpSendOutcome> {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({}),
     });
+    if (!response.headers.get('content-type')?.includes('application/json')) {
+      return {
+        ok: false,
+        error: 'The OTP API is not running. For local sign-in, start the app with "npm run dev:vercel" instead of "npm run dev" or "npm run preview".',
+      };
+    }
     const data = (await response.json().catch(() => ({}))) as {
       ok?: boolean;
       challengeId?: string;
