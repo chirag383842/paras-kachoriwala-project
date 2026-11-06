@@ -1,4 +1,4 @@
-import { verifyOtp, OtpError } from '../_lib/otp';
+import { verifyOtp, OtpError } from '../_lib/otp.js';
 
 type ApiRequest = { method?: string; body?: unknown };
 type ApiResponse = {

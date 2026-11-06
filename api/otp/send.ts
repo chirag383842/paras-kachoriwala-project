@@ -1,4 +1,4 @@
-import { createAndSendOtp, OtpError, OTP_TTL_SECONDS } from '../_lib/otp';
+import { createAndSendOtp, OtpError, OTP_TTL_SECONDS } from '../_lib/otp.js';
 
 type ApiRequest = { method?: string; body?: unknown };
 type ApiResponse = {
