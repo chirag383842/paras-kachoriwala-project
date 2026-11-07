@@ -490,7 +490,10 @@ export default function Admin({ onNavigate }: Props) {
       crowd_level: crowd,
       closed_for_date: null,
       force_open_date: null,
-      override_mode: null,
+      // Explicit "auto" mode: the saved status is never latched for the rest of
+      // the day, so the shop is re-derived from the IST schedule and reopens at
+      // 7:30 PM even with no browser or Admin Panel open.
+      override_mode: 'auto',
     });
 
     if (res.success) {
@@ -1410,6 +1413,11 @@ export default function Admin({ onNavigate }: Props) {
   const istDate = getISTDate();
   const isClosedForToday = storeComputed.isClosedForToday;
 
+  // Reflects the value SAVED in Supabase (not a temporary frontend state):
+  // "auto" or no override means the automatic schedule governs the shop.
+  const isAutoScheduleOn =
+    !storeStatus?.override_mode || storeStatus.override_mode === 'auto';
+
   // Folder helper list for gallery (Exactly 4 folders)
   const folderCategories = [
     { id: 'customers', label: 'Customers / Community Section', icon: <Users size={16} />, desc: 'Happy customers & foodies' },
@@ -1814,11 +1822,34 @@ export default function Admin({ onNavigate }: Props) {
                 </div>
 
                 {/* 2. Open / Regular Schedule Toggle */}
-                <div className="p-5 rounded-2xl bg-leaf-50/70 border border-leaf-200 space-y-3">
-                  <p className="font-bold text-base text-leaf-900">Resume Automatic Schedule</p>
-                  <p className="text-xs text-leaf-700 leading-relaxed">
-                    Clear any manual open/close overrides and strictly follow the real-time daily schedule (7:30 PM –
-                    12:00 AM IST).
+                <div
+                  className={`p-5 rounded-2xl border space-y-3 ${
+                    isAutoScheduleOn
+                      ? 'bg-leaf-50/70 border-leaf-300 ring-1 ring-leaf-500/30'
+                      : 'bg-amber-50/70 border-amber-300 ring-1 ring-amber-500/30'
+                  }`}
+                >
+                  <div className="flex items-center justify-between gap-3">
+                    <p className={`font-bold text-base ${isAutoScheduleOn ? 'text-leaf-900' : 'text-amber-900'}`}>
+                      Resume Automatic Schedule
+                    </p>
+                    <span
+                      className={`inline-flex shrink-0 items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] font-bold uppercase tracking-wide text-white ${
+                        isAutoScheduleOn ? 'bg-leaf-600' : 'bg-amber-500'
+                      }`}
+                    >
+                      <span className="h-2 w-2 rounded-full bg-white" />
+                      {isAutoScheduleOn ? 'ON' : 'OFF'}
+                    </span>
+                  </div>
+                  <p
+                    className={`text-xs leading-relaxed ${
+                      isAutoScheduleOn ? 'text-leaf-700' : 'text-amber-800'
+                    }`}
+                  >
+                    {isAutoScheduleOn
+                      ? 'Saved in the database: no manual override is active, so the shop strictly follows the real-time daily schedule (7:30 PM – 12:00 AM IST).'
+                      : 'Saved in the database: a manual open/close override is active for today, so the automatic schedule is suspended. Click below to clear it and resume.'}
                   </p>
                   <button
                     onClick={handleResumeSchedule}

@@ -135,6 +135,22 @@ export function calculateStoreStatus(status?: StoreStatus | null): {
   const istAmPm = ist.hour >= 12 ? 'PM' : 'AM';
   const istTimeStr = `${istHour12}:${String(ist.minute).padStart(2, '0')} ${istAmPm} IST`;
 
+  // 0. Author explicitly resumed the automatic schedule.
+  //    This mode never latches: the status is always derived from the IST clock
+  //    so the shop reopens at 7:30 PM even if no browser or Admin Panel is open.
+  if (status?.override_mode === 'auto') {
+    return {
+      isOpen: inScheduleHours,
+      isClosedForToday: false,
+      isForcedOpen: false,
+      isAutoScheduled: true,
+      nextOpenText: inScheduleHours ? 'Open Now (7:30 PM – 12:00 AM)' : nextText,
+      todayScheduleDisplay: todaySchedule.display,
+      statusLabel: inScheduleHours ? 'Open Now' : 'Currently Closed',
+      currentISTTimeDisplay: istTimeStr,
+    };
+  }
+
   // Determine the IST date on which this status / override was recorded
   let lastUpdatedISTDate: string | null = null;
   if (status?.last_updated) {

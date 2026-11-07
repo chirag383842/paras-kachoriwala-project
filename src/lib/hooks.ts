@@ -71,18 +71,6 @@ const DEFAULT_PRODUCTS: Product[] = [
     featured: false,
     display_order: 4,
   },
-  {
-    id: '52f0f8d7-403b-491e-bc93-ea34c63871d5',
-    slug: 'crash-kachori',
-    name: 'crash kachori',
-    price: 60,
-    description: 'Special crash kachori with crunchy toppings and rich chutneys.',
-    image_url: '/images/kachori.webp',
-    available: true,
-    stock: 50,
-    featured: false,
-    display_order: 5,
-  },
 ];
 
 const INITIAL_PINNED_REVIEWS: Review[] = [
@@ -171,6 +159,11 @@ const STORAGE_UNFEATURED_REVIEWS_KEY = 'pk_unfeatured_review_ids_v4';
 // deleted remotely (present before, missing now) so the cached copy on this
 // device can never resurrect them.
 const STORAGE_REMOTE_REVIEWS_KEY = 'pk_remote_review_ids_v1';
+// IDs/slugs of menu products that have been confirmed present in the Supabase
+// `products` table by at least one successful read. Used to detect products
+// that were deleted remotely (present before, missing now) so the cached copy
+// on this device can never resurrect them.
+const STORAGE_REMOTE_PRODUCTS_KEY = 'pk_remote_product_keys_v1';
 
 // Actively purge all legacy cache keys from earlier app builds across all customer & admin devices
 const LEGACY_STORAGE_KEYS = [
@@ -551,6 +544,100 @@ export function reconcileRemoteReviewIds(remoteIds: Iterable<string>): number {
   }
 }
 
+function getKnownRemoteProductKeys(): Set<string> {
+  try {
+    const raw = localStorage.getItem(STORAGE_REMOTE_PRODUCTS_KEY);
+    return raw ? new Set<string>(JSON.parse(raw)) : new Set<string>();
+  } catch {
+    return new Set<string>();
+  }
+}
+
+const PRODUCT_ID_UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// A cached product is only treated as remotely deleted once it is old enough
+// that its own database insert must already have completed. This keeps an
+// in-flight "add product" from being mistaken for a deletion.
+const REMOTE_PRODUCT_DELETE_GRACE_MS = 2 * 60 * 1000;
+
+/**
+ * Supabase is the single source of truth for the menu.
+ *
+ * A product that is still held in the local cache (or the seeded default list)
+ * but is missing from a *successful* remote read was deleted — from this device
+ * or from the Admin Panel on another device. Such products are tombstoned so
+ * the cached copy, the Google Sheets mirror, or a stale local list can never
+ * resurrect them on any device.
+ *
+ * Products that were never persisted remotely (they have no database id) are
+ * left untouched.
+ *
+ * Must only be called after a successful remote read (i.e. `data` is an array),
+ * otherwise a network failure would look like "everything deleted".
+ *
+ * @param remoteKeys IDs and slugs returned by the latest successful Supabase read.
+ * @param localProducts Products currently held in memory/local cache.
+ * @returns the keys that were newly tombstoned.
+ */
+export function reconcileRemoteProductKeys(
+  remoteKeys: Iterable<string>,
+  localProducts: Product[]
+): string[] {
+  try {
+    const remote = new Set<string>();
+    for (const key of remoteKeys) if (key) remote.add(key);
+
+    const known = getKnownRemoteProductKeys();
+    const now = Date.now();
+    const tombstoned = new Set<string>();
+
+    // 1. Products previously confirmed present in Supabase and now missing.
+    known.forEach((key) => {
+      if (!remote.has(key)) tombstoned.add(key);
+    });
+
+    // 2. Products still held locally with a real database id but absent from
+    //    the authoritative remote list.
+    localProducts.forEach((p) => {
+      if (!p) return;
+      if (remote.has(p.id) || (p.slug && remote.has(p.slug))) return;
+      if (!PRODUCT_ID_UUID_PATTERN.test(p.id || '')) return;
+      const updatedAt = p.updated_at ? new Date(p.updated_at).getTime() : Number.NaN;
+      if (Number.isFinite(updatedAt) && now - updatedAt < REMOTE_PRODUCT_DELETE_GRACE_MS) return;
+      if (p.id) tombstoned.add(p.id);
+      if (p.slug) tombstoned.add(p.slug);
+    });
+
+    if (tombstoned.size === 0) {
+      // Refresh the ledger so products that just synced are remembered.
+      const next = new Set(known);
+      remote.forEach((key) => next.add(key));
+      try {
+        localStorage.setItem(STORAGE_REMOTE_PRODUCTS_KEY, JSON.stringify(Array.from(next)));
+      } catch {
+        /* ignore */
+      }
+      return [];
+    }
+
+    tombstoned.forEach((key) => markProductDeleted(key));
+
+    const next = new Set(known);
+    remote.forEach((key) => next.add(key));
+    tombstoned.forEach((key) => next.delete(key));
+    try {
+      localStorage.setItem(STORAGE_REMOTE_PRODUCTS_KEY, JSON.stringify(Array.from(next)));
+    } catch {
+      /* ignore */
+    }
+
+    return Array.from(tombstoned);
+  } catch {
+    return [];
+  }
+}
+
 export function getDeletedGalleryIds(): Set<string> {
   try {
     const raw = localStorage.getItem(STORAGE_DELETED_GALLERY_KEY);
@@ -616,6 +703,17 @@ export function useProducts() {
           const error = sbRes.error;
           const deleted = getDeletedProductSlugs();
           const baseList = memoryProducts ?? cached ?? DEFAULT_PRODUCTS;
+
+          // Supabase is authoritative for the menu: anything a successful read
+          // no longer returns is treated as deleted and tombstoned locally, so
+          // a cached copy, the Sheets mirror or the seeded default list cannot
+          // resurrect it on any device.
+          if (!error && Array.isArray(data)) {
+            reconcileRemoteProductKeys(
+              (data as Product[]).flatMap((p) => [p.id, p.slug]),
+              baseList
+            ).forEach((key) => deleted.add(key));
+          }
 
           // Merge deleted products from cloud
           if (cloudState && Array.isArray(cloudState.deleted_products)) {
@@ -1820,7 +1918,7 @@ export async function updateStoreStatus(status: {
   crowd_level: string;
   closed_for_date?: string | null;
   force_open_date?: string | null;
-  override_mode?: 'force_open' | 'force_close' | 'closed_now' | 'closed_today' | null;
+  override_mode?: 'force_open' | 'force_close' | 'closed_now' | 'closed_today' | 'auto' | null;
 }): Promise<{ success: boolean; error?: string; remoteSync?: boolean; rlsBlocked?: boolean }> {
   const timestamp = new Date().toISOString();
   const metaObj = {
