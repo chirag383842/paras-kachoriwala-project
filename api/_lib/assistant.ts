@@ -240,11 +240,17 @@ export async function askAssistant(history: ChatMessage[]): Promise<string> {
       body: JSON.stringify({ model, messages, temperature: 0.3, max_tokens: 400 }),
       signal: AbortSignal.timeout(20000),
     });
-  } catch {
+  } catch (error) {
+    console.error('[assistant] provider request failed before receiving a response', {
+      errorName: error instanceof Error ? error.name : 'UnknownError',
+    });
     throw new AssistantError('The assistant could not be reached. Please try again.', 502);
   }
 
   if (!response.ok) {
+    console.error('[assistant] provider returned an unsuccessful response', {
+      status: response.status,
+    });
     if (response.status === 401 || response.status === 403) {
       throw new AssistantError('The assistant is not configured correctly.', 503);
     }
