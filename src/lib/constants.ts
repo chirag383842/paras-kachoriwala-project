@@ -1,4 +1,4 @@
-import type { StoreStatus } from './types';
+import type { StoreStatus } from './types.js';
 
 export const BRAND = {
   name: 'Paras Kachoriwala',
