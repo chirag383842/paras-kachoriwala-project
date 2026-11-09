@@ -5,7 +5,6 @@ import Home from '@/pages/Home';
 import { BRAND } from '@/lib/constants';
 import { LoadingProvider, useLoading } from '@/lib/loadingContext';
 import SmartLoadingScreen from '@/components/SmartLoadingScreen';
-import AssistantWidget from '@/components/AssistantWidget';
 
 const Menu = lazy(() => import('@/pages/Menu'));
 const Gallery = lazy(() => import('@/pages/Gallery'));
@@ -101,7 +100,6 @@ function AppInner() {
         </main>
         <Footer onNavigate={navigate} />
       </div>
-      {page !== 'admin' && <AssistantWidget />}
     </>
   );
 }
