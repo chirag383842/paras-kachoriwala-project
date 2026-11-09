@@ -214,6 +214,23 @@ export function redactSecrets(text: string): string {
 export type ChatMessage = { role: 'user' | 'assistant'; content: string };
 
 /**
+ * Reads the provider's own error text so a failure can be classified. Provider
+ * error messages never contain the key or the request body, so this is safe to
+ * keep for diagnostics.
+ */
+async function providerErrorReason(response: Response): Promise<string> {
+  try {
+    const body = (await response.json()) as {
+      error?: { message?: string; status?: string; type?: string };
+    };
+    const text = `${body.error?.status ?? body.error?.type ?? ''} ${body.error?.message ?? ''}`;
+    return text.trim().slice(0, 200);
+  } catch {
+    return '';
+  }
+}
+
+/**
  * Sends the conversation to the configured provider together with the live
  * public facts, and returns the reply with credentials redacted.
  */
@@ -221,12 +238,20 @@ export async function askAssistant(history: ChatMessage[]): Promise<string> {
   const { apiKey, baseUrl, model } = getAiConfig();
   const context = await buildPublicContext();
 
+  // The conversation must open with a user turn. A leading assistant message
+  // (such as the greeting the widget shows first) is sent as a `model` turn,
+  // which the provider rejects, so it is dropped here.
+  let firstUserTurn = 0;
+  while (firstUserTurn < history.length && history[firstUserTurn].role !== 'user') {
+    firstUserTurn += 1;
+  }
+
   const messages = [
     {
       role: 'system',
       content: `${SYSTEM_RULES}\n\n=== LIVE BUSINESS DATA ===\n${context}\n=== END LIVE BUSINESS DATA ===`,
     },
-    ...history,
+    ...history.slice(firstUserTurn),
   ];
 
   let response: Response;
@@ -248,11 +273,20 @@ export async function askAssistant(history: ChatMessage[]): Promise<string> {
   }
 
   if (!response.ok) {
+    const reason = await providerErrorReason(response);
     console.error('[assistant] provider returned an unsuccessful response', {
       status: response.status,
+      reason,
     });
-    if (response.status === 401 || response.status === 403) {
-      throw new AssistantError('The assistant is not configured correctly.', 503);
+    // The provider reports an invalid key as a 400, so the status code alone
+    // cannot separate a configuration problem from a transient outage.
+    const misconfigured =
+      response.status === 401 ||
+      response.status === 403 ||
+      response.status === 404 ||
+      /api[\s_-]?key|credential|unauthor|not found|not supported|unsupported|permission/i.test(reason);
+    if (misconfigured) {
+      throw new AssistantError('The assistant is not configured correctly. Please try again later.', 503);
     }
     throw new AssistantError('The assistant is temporarily unavailable. Please try again.', 502);
   }
