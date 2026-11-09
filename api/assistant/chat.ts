@@ -71,6 +71,17 @@ function isAllowedOrigin(req: ApiRequest): boolean {
 
 type ParsedBody = { message: string; history: ChatMessage[] };
 
+/** Strips control characters so only plain text ever reaches the model. */
+function clean(text: string): string {
+  let out = '';
+  for (const char of text) {
+    const code = char.charCodeAt(0);
+    if (code <= 8 || code === 11 || code === 12 || (code >= 14 && code <= 31) || code === 127) continue;
+    out += char;
+  }
+  return out.trim();
+}
+
 function parseBody(body: unknown): ParsedBody | null {
   let raw: unknown = body;
   if (typeof raw === 'string') {
@@ -83,7 +94,7 @@ function parseBody(body: unknown): ParsedBody | null {
   if (!raw || typeof raw !== 'object') return null;
 
   const source = raw as Record<string, unknown>;
-  const message = typeof source.message === 'string' ? source.message.trim() : '';
+  const message = typeof source.message === 'string' ? clean(source.message) : '';
   if (!message) return null;
 
   const history: ChatMessage[] = [];
@@ -92,7 +103,7 @@ function parseBody(body: unknown): ParsedBody | null {
     if (!entry || typeof entry !== 'object') continue;
     const item = entry as Record<string, unknown>;
     const role = item.role === 'assistant' ? 'assistant' : item.role === 'user' ? 'user' : null;
-    const content = typeof item.content === 'string' ? item.content.trim() : '';
+    const content = typeof item.content === 'string' ? clean(item.content) : '';
     if (!role || !content) continue;
     history.push({ role, content: content.slice(0, MAX_MESSAGE_CHARS) });
   }

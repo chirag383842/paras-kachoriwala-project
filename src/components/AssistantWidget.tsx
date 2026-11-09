@@ -1,12 +1,15 @@
 import { useEffect, useRef, useState } from 'react';
-import { MessageCircle, Send, Sparkles, X } from 'lucide-react';
+import { MessageCircle, Send, X } from 'lucide-react';
 
 type ChatEntry = { role: 'user' | 'assistant'; content: string };
+
+/** The same asset the website header uses, so the assistant shows the real logo. */
+const LOGO_SRC = '/images/logo.png';
 
 const GREETING: ChatEntry = {
   role: 'assistant',
   content:
-    "Namaste! I'm the Paras Kachoriwala assistant. Ask me about our menu, today's prices, live availability, opening hours or how to reach us.",
+    "Hi there! 👋 Welcome to Paras Kachoriwala!\n\nI'm your virtual assistant. I can help you explore our menu, check live shop availability, discover food photos, read customer reviews, find our shop location, and navigate our website.\n\nHow can I help you today?",
 };
 
 const SUGGESTIONS = ['Are you open right now?', 'What is on the menu today?', 'Where are you located?'];
@@ -91,8 +94,13 @@ export default function AssistantWidget() {
           className="fixed inset-x-3 bottom-3 z-50 flex max-h-[78vh] flex-col overflow-hidden rounded-2xl border border-spice-100 bg-white shadow-warm animate-scale-in sm:inset-x-auto sm:bottom-5 sm:right-5 sm:w-[380px] origin-bottom-right"
         >
           <header className="flex items-start gap-3 bg-spice-600 px-4 py-3.5 text-white">
-            <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-white/15">
-              <Sparkles className="h-4 w-4" aria-hidden="true" />
+            <div className="flex h-9 w-9 shrink-0 items-center justify-center overflow-hidden rounded-full bg-white p-0.5">
+              <img
+                src={LOGO_SRC}
+                alt=""
+                className="block h-full w-full object-contain object-center"
+                draggable={false}
+              />
             </div>
             <div className="min-w-0 flex-1">
               <p className="font-display text-base font-bold leading-tight">Paras Kachoriwala</p>
@@ -178,9 +186,6 @@ export default function AssistantWidget() {
                 <Send className="h-4 w-4" aria-hidden="true" />
               </button>
             </div>
-            <p className="mt-2 text-[10px] leading-snug text-charcoal-400">
-              Answers use live public shop information only. Never shares passwords, OTPs, keys or account data.
-            </p>
           </form>
         </section>
       )}
