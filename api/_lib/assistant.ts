@@ -155,13 +155,27 @@ function deriveStoreStatus(result: RestResult): StoreStatus | null {
 }
 
 /**
+ * In-memory cache for the public data block. Serverless instances are recycled,
+ * so this is a short-lived optimisation: it cuts repeated Supabase reads within
+ * a 30-second window (e.g. a visitor asking several quick questions). It is not
+ * a durability guarantee — a cold instance always reads fresh.
+ */
+const CONTEXT_CACHE_TTL_MS = 30 * 1000;
+let contextCache: { value: string; expiresAt: number } | null = null;
+
+/**
  * Builds the live facts block the model is allowed to see: menu, prices,
  * availability, opening hours, live open state, the complete address, public
  * reviews, gallery contents and the website sections. It is read fresh on every
  * question, so admin changes are reflected immediately. Anything that could not
  * be read is marked as unverified instead of being guessed.
  */
-export async function buildPublicContext(): Promise<string> {
+export async function buildPublicContext(forceRefresh = false): Promise<string> {
+  const now = Date.now();
+  if (!forceRefresh && contextCache && contextCache.expiresAt > now) {
+    return contextCache.value;
+  }
+
   const [productsResult, statusResult, reviewsResult, galleryResult] = await Promise.all([
     restGet('products?select=name,price,description,available,display_order&order=display_order.asc'),
     restGet('store_status?select=id,is_open,crowd_level,last_updated,updated_by&limit=1'),
@@ -255,7 +269,9 @@ export async function buildPublicContext(): Promise<string> {
     lines.push(`GALLERY CONTENT: ${gallery.length} public items (${summary}).`);
   }
 
-  return lines.join('\n');
+  const value = lines.join('\n');
+  contextCache = { value, expiresAt: Date.now() + CONTEXT_CACHE_TTL_MS };
+  return value;
 }
 
 const SYSTEM_RULES = `You are the official assistant of ${BRAND.name}, a kachori shop in Vadodara, Gujarat, India. You are talking to customers on the shop's public website.
@@ -377,15 +393,22 @@ export type ChatMessage = { role: 'user' | 'assistant'; content: string };
  * keep for diagnostics.
  */
 async function providerErrorReason(response: Response): Promise<string> {
+  let raw = '';
   try {
-    const body = (await response.json()) as {
-      error?: { message?: string; status?: string; type?: string };
-    };
-    const text = `${body.error?.status ?? body.error?.type ?? ''} ${body.error?.message ?? ''}`;
-    return text.trim().slice(0, 200);
+    raw = await response.text();
   } catch {
     return '';
   }
+  try {
+    const body = JSON.parse(raw) as {
+      error?: { message?: string; status?: string; type?: string };
+    };
+    const text = `${body.error?.status ?? body.error?.type ?? ''} ${body.error?.message ?? ''}`.trim();
+    if (text) return text.slice(0, 220);
+  } catch {
+    // Not JSON — fall through and use the raw text so the reason is still visible.
+  }
+  return raw.replace(/\s+/g, ' ').trim().slice(0, 220);
 }
 
 /** The provider is rejecting our key or our access, not the customer's question. */
@@ -453,10 +476,16 @@ async function callProvider(
 const GOOGLE_HOST = 'generativelanguage.googleapis.com';
 
 /**
- * Tried only when the configured model is rejected, so a retired or mistyped
- * model name cannot take the assistant down.
+ * Free-tier Gemini models tried in order. Each model has its own quota bucket,
+ * so when one returns 429 the next may still answer. The configured model is
+ * always tried first; this list covers for a retired or rate-limited model.
  */
-const GOOGLE_FALLBACK_MODELS = ['gemini-3-flash-preview', 'gemini-2.5-flash'];
+const GOOGLE_FALLBACK_MODELS = [
+  'gemini-3-flash-preview',
+  'gemini-flash-latest',
+  'gemini-2.5-flash',
+  'gemini-2.0-flash',
+];
 
 function modelsToTry(config: AiConfig): string[] {
   const models = [config.model];
@@ -499,10 +528,17 @@ export async function askAssistant(history: ChatMessage[]): Promise<string> {
     if (attempt.ok) return redactSecrets(attempt.reply);
 
     failure = { status: attempt.status, reason: attempt.reason };
-    // Only an unknown model is worth retrying; a rejected key never is.
-    if (!isModelProblem(attempt.status, attempt.reason)) break;
+    // Retry the next model when the current one is unknown OR rate-limited
+    // (each Gemini model has its own free-tier quota bucket).
+    if (!isModelProblem(attempt.status, attempt.reason) && attempt.status !== 429) break;
   }
 
+  if (failure.status === 429) {
+    throw new AssistantError(
+      'The assistant is getting a lot of requests right now. Please wait a few minutes and try again.',
+      503,
+    );
+  }
   if (isConfigProblem(failure.status, failure.reason) || isModelProblem(failure.status, failure.reason)) {
     throw new AssistantError('The assistant is not configured correctly. Please try again later.', 503);
   }

@@ -15,6 +15,68 @@ const GREETING: ChatEntry = {
 const SUGGESTIONS = ['Are you open right now?', 'What is on the menu today?', 'Where are you located?'];
 
 /**
+ * Client-side answer cache. Most visitors ask the same small set of questions
+ * (menu, hours, address). Caching the answer for an hour means those repeats
+ * never call the provider, stretching the free quota much further. Only fresh
+ * questions (no prior turns) are cached, so follow-up questions still go live.
+ */
+const CACHE_KEY = 'pk_assistant_cache_v1';
+const CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour
+
+type CacheEntry = { reply: string; expiresAt: number };
+type CacheMap = Record<string, CacheEntry>;
+
+function cacheKey(text: string): string {
+  return text.toLowerCase().replace(/[^a-z0-9\s]/g, '').replace(/\s+/g, ' ').trim();
+}
+
+function readCache(): CacheMap {
+  try {
+    const raw = localStorage.getItem(CACHE_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as CacheMap;
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeCache(map: CacheMap): void {
+  try {
+    localStorage.setItem(CACHE_KEY, JSON.stringify(map));
+  } catch {
+    // Storage may be unavailable (private mode, etc.) — ignore silently.
+  }
+}
+
+function cachedReply(message: string): string | null {
+  const key = cacheKey(message);
+  if (!key) return null;
+  const map = readCache();
+  const entry = map[key];
+  if (!entry) return null;
+  if (entry.expiresAt < Date.now()) {
+    delete map[key];
+    writeCache(map);
+    return null;
+  }
+  return entry.reply;
+}
+
+function storeCachedReply(message: string, reply: string): void {
+  const key = cacheKey(message);
+  if (!key) return;
+  const map = readCache();
+  map[key] = { reply, expiresAt: Date.now() + CACHE_TTL_MS };
+  // Keep the cache bounded so it never grows unboundedly.
+  const keys = Object.keys(map);
+  if (keys.length > 40) {
+    keys.slice(0, keys.length - 40).forEach((k) => delete map[k]);
+  }
+  writeCache(map);
+}
+
+/**
  * Public shop assistant. Answers from live public data only; it has no access
  * to credentials, OTPs, admin data or customer data, and refuses such requests.
  */
@@ -39,6 +101,18 @@ export default function AssistantWidget() {
     setEntries((prev) => [...prev, { role: 'user', content: message }]);
     setSending(true);
 
+    // Only fresh questions (just the greeting before this) are cached, so a
+    // follow-up in a conversation always gets a live answer.
+    const isFreshQuestion = entries.length <= 1;
+    if (isFreshQuestion) {
+      const cached = cachedReply(message);
+      if (cached) {
+        setEntries((prev) => [...prev, { role: 'assistant', content: cached }]);
+        setSending(false);
+        return;
+      }
+    }
+
     try {
       const response = await fetch('/api/assistant/chat', {
         method: 'POST',
@@ -54,7 +128,9 @@ export default function AssistantWidget() {
         | null;
 
       if (response.ok && payload?.ok && payload.reply) {
-        setEntries((prev) => [...prev, { role: 'assistant', content: payload.reply as string }]);
+        const reply = payload.reply as string;
+        if (isFreshQuestion) storeCachedReply(message, reply);
+        setEntries((prev) => [...prev, { role: 'assistant', content: reply }]);
       } else {
         setEntries((prev) => [
           ...prev,
