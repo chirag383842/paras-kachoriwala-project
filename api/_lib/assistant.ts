@@ -230,12 +230,92 @@ async function providerErrorReason(response: Response): Promise<string> {
   }
 }
 
+/** The provider is rejecting our key or our access, not the customer's question. */
+function isConfigProblem(status: number, reason: string): boolean {
+  return (
+    status === 401 ||
+    status === 403 ||
+    /api[\s_-]?key|credential|unauthor|permission|billing/i.test(reason)
+  );
+}
+
+/** The provider does not recognise the model it was asked for. */
+function isModelProblem(status: number, reason: string): boolean {
+  return status === 404 || /model|not found|not supported|unsupported|does not exist/i.test(reason);
+}
+
+type Attempt = { ok: true; reply: string } | { ok: false; status: number; reason: string };
+
+/** One provider call, for one model. */
+async function callProvider(
+  config: AiConfig,
+  model: string,
+  messages: unknown[],
+): Promise<Attempt> {
+  let response: Response;
+  try {
+    response = await fetch(`${config.baseUrl}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${config.apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ model, messages, temperature: 0.3, max_tokens: 400 }),
+      signal: AbortSignal.timeout(20000),
+    });
+  } catch (error) {
+    console.error('[assistant] provider request failed before receiving a response', {
+      errorName: error instanceof Error ? error.name : 'UnknownError',
+    });
+    throw new AssistantError('The assistant could not be reached. Please try again.', 502);
+  }
+
+  if (!response.ok) {
+    const reason = await providerErrorReason(response);
+    console.error('[assistant] provider rejected the request', {
+      model,
+      status: response.status,
+      reason,
+    });
+    return { ok: false, status: response.status, reason };
+  }
+
+  const payload = (await response.json()) as {
+    choices?: { message?: { content?: string } }[];
+  };
+  const reply = payload?.choices?.[0]?.message?.content;
+
+  if (!reply || !reply.trim()) {
+    throw new AssistantError('The assistant did not return an answer. Please try again.', 502);
+  }
+
+  return { ok: true, reply: reply.trim() };
+}
+
+const GOOGLE_HOST = 'generativelanguage.googleapis.com';
+
+/**
+ * Tried only when the configured model is rejected, so a retired or mistyped
+ * model name cannot take the assistant down.
+ */
+const GOOGLE_FALLBACK_MODELS = ['gemini-3-flash-preview', 'gemini-2.5-flash'];
+
+function modelsToTry(config: AiConfig): string[] {
+  const models = [config.model];
+  if (config.baseUrl.includes(GOOGLE_HOST)) {
+    for (const candidate of GOOGLE_FALLBACK_MODELS) {
+      if (!models.includes(candidate)) models.push(candidate);
+    }
+  }
+  return models;
+}
+
 /**
  * Sends the conversation to the configured provider together with the live
  * public facts, and returns the reply with credentials redacted.
  */
 export async function askAssistant(history: ChatMessage[]): Promise<string> {
-  const { apiKey, baseUrl, model } = getAiConfig();
+  const config = getAiConfig();
   const context = await buildPublicContext();
 
   // The conversation must open with a user turn. A leading assistant message
@@ -254,51 +334,63 @@ export async function askAssistant(history: ChatMessage[]): Promise<string> {
     ...history.slice(firstUserTurn),
   ];
 
-  let response: Response;
+  let failure = { status: 0, reason: '' };
+
+  for (const model of modelsToTry(config)) {
+    const attempt = await callProvider(config, model, messages);
+    if (attempt.ok) return redactSecrets(attempt.reply);
+
+    failure = { status: attempt.status, reason: attempt.reason };
+    // Only an unknown model is worth retrying; a rejected key never is.
+    if (!isModelProblem(attempt.status, attempt.reason)) break;
+  }
+
+  if (isConfigProblem(failure.status, failure.reason) || isModelProblem(failure.status, failure.reason)) {
+    throw new AssistantError('The assistant is not configured correctly. Please try again later.', 503);
+  }
+  throw new AssistantError('The assistant is temporarily unavailable. Please try again.', 502);
+}
+
+/**
+ * Non-secret configuration report for the site owner: whether the key is set,
+ * which host and model are configured, and what the provider answers. The key
+ * itself is never included, so this is safe to expose.
+ */
+export async function describeAssistant(): Promise<Record<string, unknown>> {
+  let config: AiConfig;
   try {
-    response = await fetch(`${baseUrl}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ model, messages, temperature: 0.3, max_tokens: 400 }),
-      signal: AbortSignal.timeout(20000),
-    });
-  } catch (error) {
-    console.error('[assistant] provider request failed before receiving a response', {
-      errorName: error instanceof Error ? error.name : 'UnknownError',
-    });
-    throw new AssistantError('The assistant could not be reached. Please try again.', 502);
+    config = getAiConfig();
+  } catch {
+    return { keySet: false, problem: 'AI_API_KEY is not set.' };
   }
 
-  if (!response.ok) {
-    const reason = await providerErrorReason(response);
-    console.error('[assistant] provider returned an unsuccessful response', {
-      status: response.status,
-      reason,
-    });
-    // The provider reports an invalid key as a 400, so the status code alone
-    // cannot separate a configuration problem from a transient outage.
-    const misconfigured =
-      response.status === 401 ||
-      response.status === 403 ||
-      response.status === 404 ||
-      /api[\s_-]?key|credential|unauthor|not found|not supported|unsupported|permission/i.test(reason);
-    if (misconfigured) {
-      throw new AssistantError('The assistant is not configured correctly. Please try again later.', 503);
-    }
-    throw new AssistantError('The assistant is temporarily unavailable. Please try again.', 502);
-  }
-
-  const payload = (await response.json()) as {
-    choices?: { message?: { content?: string } }[];
+  const report: Record<string, unknown> = {
+    keySet: true,
+    baseHost: '',
+    model: config.model,
+    answeringModel: '',
+    providerStatus: 0,
+    providerReason: '',
   };
-  const reply = payload?.choices?.[0]?.message?.content;
 
-  if (!reply || !reply.trim()) {
-    throw new AssistantError('The assistant did not return an answer. Please try again.', 502);
+  try {
+    report.baseHost = new URL(config.baseUrl).host;
+  } catch {
+    report.problem = 'AI_BASE_URL is not a valid URL.';
+    return report;
   }
 
-  return redactSecrets(reply.trim());
+  for (const model of modelsToTry(config)) {
+    const attempt = await callProvider(config, model, [{ role: 'user', content: 'ping' }]);
+    if (attempt.ok) {
+      report.answeringModel = model;
+      report.providerStatus = 200;
+      return report;
+    }
+    report.providerStatus = attempt.status;
+    report.providerReason = attempt.reason;
+    if (!isModelProblem(attempt.status, attempt.reason)) break;
+  }
+
+  return report;
 }
